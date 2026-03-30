@@ -1,0 +1,2 @@
+"""Fed-EGS package."""
+
