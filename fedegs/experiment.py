@@ -66,17 +66,21 @@ def _run_single_algorithm(algorithm_name: str, config, data_bundle, data_module,
         metrics = result.get("metrics", {})
         summary_step = 0
         if "routed_accuracy" in metrics:
-            writer.add_scalars("summary/routed_accuracy", {algorithm_name: metrics["routed_accuracy"]}, summary_step)
+            writer.add_scalar("summary/routed_accuracy", metrics["routed_accuracy"], summary_step)
         elif "accuracy" in metrics:
-            writer.add_scalars("summary/routed_accuracy", {algorithm_name: metrics["accuracy"]}, summary_step)
+            writer.add_scalar("summary/routed_accuracy", metrics["accuracy"], summary_step)
         if "routed_hard_accuracy" in metrics:
-            writer.add_scalars("summary/hard_accuracy", {algorithm_name: metrics["routed_hard_accuracy"]}, summary_step)
+            writer.add_scalar("summary/hard_accuracy", metrics["routed_hard_accuracy"], summary_step)
         elif "hard_accuracy" in metrics:
-            writer.add_scalars("summary/hard_accuracy", {algorithm_name: metrics["hard_accuracy"]}, summary_step)
+            writer.add_scalar("summary/hard_accuracy", metrics["hard_accuracy"], summary_step)
         if "general_invocation_rate" in metrics:
-            writer.add_scalars("summary/invocation_rate", {algorithm_name: metrics["general_invocation_rate"]}, summary_step)
+            writer.add_scalar("summary/invocation_rate", metrics["general_invocation_rate"], summary_step)
         elif "invocation_rate" in metrics:
-            writer.add_scalars("summary/invocation_rate", {algorithm_name: metrics["invocation_rate"]}, summary_step)
+            writer.add_scalar("summary/invocation_rate", metrics["invocation_rate"], summary_step)
+        if "expert_only_accuracy" in metrics:
+            writer.add_scalar("summary/expert_accuracy", metrics["expert_only_accuracy"], summary_step)
+        if "general_only_accuracy" in metrics:
+            writer.add_scalar("summary/general_accuracy", metrics["general_only_accuracy"], summary_step)
         if "final_training_loss" in metrics:
-            writer.add_scalars("summary/final_training_loss", {algorithm_name: metrics["final_training_loss"]}, summary_step)
+            writer.add_scalar("summary/final_training_loss", metrics["final_training_loss"], summary_step)
     return history, result

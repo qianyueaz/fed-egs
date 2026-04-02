@@ -56,6 +56,10 @@ class ModelConfig:
     num_classes: int = 10
     general_width: float = 1.0
     expert_width: float = 0.25
+    expert_base_channels: int = 32
+    baseline_architecture: str = "width_scalable_resnet18"
+    baseline_width: Optional[float] = None
+    baseline_base_channels: int = 32
 
 
 @dataclass

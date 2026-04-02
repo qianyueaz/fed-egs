@@ -1,6 +1,8 @@
+import csv
 import logging
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -103,18 +105,96 @@ class BaseFederatedServer:
         self.client_test_datasets = client_test_datasets
         self.public_dataset = public_dataset
 
+    def _dual_threshold_route(
+        self,
+        expert_model: nn.Module,
+        general_model: nn.Module,
+        images: torch.Tensor,
+    ) -> Tuple[torch.Tensor, int, Dict[str, object]]:
+        high_threshold = self.config.inference.high_threshold
+        low_threshold = self.config.inference.low_threshold
+        if high_threshold <= low_threshold:
+            raise ValueError(
+                f"Expected high_threshold > low_threshold, got high={high_threshold} low={low_threshold}"
+            )
+
+        expert_model.eval()
+        general_model.eval()
+
+        expert_logits = expert_model(images)
+        expert_probs = torch.softmax(expert_logits, dim=1)
+        expert_confidence, expert_prediction = torch.max(expert_probs, dim=1)
+
+        high_mask = expert_confidence >= high_threshold
+        low_mask = expert_confidence <= low_threshold
+        mid_mask = ~(high_mask | low_mask)
+
+        predictions = expert_prediction.clone()
+        invoked_general = 0
+        route_types = ["expert"] * images.size(0)
+
+        if low_mask.any():
+            low_general_logits = general_model(images[low_mask])
+            predictions[low_mask] = torch.argmax(low_general_logits, dim=1)
+            invoked_general += int(low_mask.sum().item())
+            for sample_idx in low_mask.nonzero(as_tuple=False).flatten().tolist():
+                route_types[sample_idx] = "general"
+
+        if mid_mask.any():
+            mid_general_logits = general_model(images[mid_mask])
+            expert_mid_logits = expert_logits[mid_mask]
+            mid_confidence = expert_confidence[mid_mask]
+
+            # Confidence closer to the high threshold trusts the expert more.
+            expert_weight = ((mid_confidence - low_threshold) / (high_threshold - low_threshold)).clamp(0.0, 1.0)
+            fused_logits = expert_weight.unsqueeze(1) * expert_mid_logits + (1.0 - expert_weight.unsqueeze(1)) * mid_general_logits
+            predictions[mid_mask] = torch.argmax(fused_logits, dim=1)
+            invoked_general += int(mid_mask.sum().item())
+            for sample_idx in mid_mask.nonzero(as_tuple=False).flatten().tolist():
+                route_types[sample_idx] = "fusion"
+
+        metadata = {
+            "route_type": route_types,
+            "expert_confidence": expert_confidence.detach().cpu().tolist(),
+        }
+        return predictions, invoked_general, metadata
+
     def _sample_client_ids(self) -> List[str]:
         return self.random.sample(
             list(self.client_datasets.keys()),
             k=min(self.config.federated.clients_per_round, len(self.client_datasets)),
         )
 
+    def _build_route_export_path(self, prefix: str) -> Path:
+        run_name = self.config.run_name or "manual_run"
+        return Path(self.config.output_dir) / "routes" / run_name / f"{prefix}.csv"
+
+    def _write_route_records_csv(self, path: Path, route_records: List[Dict[str, object]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "client_id",
+                    "sample_index",
+                    "true_label",
+                    "pred_label",
+                    "route_type",
+                    "expert_confidence",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(route_records)
+        LOGGER.info("Saved route records to %s | rows=%d", path, len(route_records))
+
     def _evaluate_predictor_on_client_tests(
         self,
         predictor: Callable[[str, torch.Tensor, List[int]], Tuple[torch.Tensor, int]],
         prefix: str,
+        route_export_path: Optional[Path] = None,
     ) -> Dict[str, object]:
         client_results: Dict[str, Dict[str, float]] = {}
+        route_records: List[Dict[str, object]] = []
         weighted_sums = {
             "accuracy": 0.0,
             "hard_accuracy": 0.0,
@@ -127,7 +207,13 @@ class BaseFederatedServer:
 
         for client_id, dataset in self.client_test_datasets.items():
             loader = self.data_module.make_loader(dataset, shuffle=False)
-            client_metrics = self._evaluate_predictor_on_loader(client_id, predictor, loader)
+            client_metrics = self._evaluate_predictor_on_loader(
+                client_id,
+                predictor,
+                loader,
+                collect_route_records=route_export_path is not None,
+            )
+            route_records.extend(client_metrics.pop("_route_records", []))
             client_results[client_id] = client_metrics
             sample_count = client_metrics["num_samples"]
             total_samples += sample_count
@@ -139,6 +225,8 @@ class BaseFederatedServer:
         aggregated["num_samples"] = total_samples
 
         self._log_client_metrics_table(prefix, client_results, aggregated)
+        if route_export_path is not None:
+            self._write_route_records_csv(route_export_path, route_records)
         return {"aggregate": aggregated, "clients": client_results}
 
     def _evaluate_predictor_on_loader(
@@ -146,23 +234,52 @@ class BaseFederatedServer:
         client_id: str,
         predictor: Callable[[str, torch.Tensor, List[int]], Tuple[torch.Tensor, int]],
         loader: DataLoader,
+        collect_route_records: bool = False,
     ) -> Dict[str, float]:
         all_predictions: List[int] = []
         all_targets: List[int] = []
         hard_predictions: List[int] = []
         hard_targets: List[int] = []
         invoked_general = 0
+        route_records: List[Dict[str, object]] = []
 
         with torch.no_grad():
             for images, targets, indices in loader:
                 images = images.to(self.device)
-                predictions, batch_invocations = predictor(client_id, images, indices.tolist())
+                predictor_output = predictor(client_id, images, indices.tolist())
+                route_metadata: Optional[Dict[str, object]] = None
+                if len(predictor_output) == 3:
+                    predictions, batch_invocations, route_metadata = predictor_output
+                else:
+                    predictions, batch_invocations = predictor_output
                 invoked_general += batch_invocations
 
                 batch_predictions = predictions.detach().cpu().tolist()
                 batch_targets = targets.tolist()
                 all_predictions.extend(batch_predictions)
                 all_targets.extend(batch_targets)
+
+                if collect_route_records and route_metadata is not None:
+                    batch_route_types = route_metadata.get("route_type")
+                    batch_confidences = route_metadata.get("expert_confidence")
+                    if batch_route_types is not None and batch_confidences is not None:
+                        for sample_index, target, pred, route_type, expert_confidence in zip(
+                            indices.tolist(),
+                            batch_targets,
+                            batch_predictions,
+                            batch_route_types,
+                            batch_confidences,
+                        ):
+                            route_records.append(
+                                {
+                                    "client_id": client_id,
+                                    "sample_index": sample_index,
+                                    "true_label": target,
+                                    "pred_label": pred,
+                                    "route_type": route_type,
+                                    "expert_confidence": f"{float(expert_confidence):.6f}",
+                                }
+                            )
 
                 for sample_index, pred, target in zip(indices.tolist(), batch_predictions, batch_targets):
                     if sample_index in self.test_hard_indices:
@@ -173,6 +290,8 @@ class BaseFederatedServer:
         hard_metrics = self._classification_metrics(hard_predictions, hard_targets) if hard_targets else {"accuracy": 0.0}
         metrics["hard_accuracy"] = hard_metrics["accuracy"]
         metrics["invocation_rate"] = invoked_general / max(len(all_targets), 1)
+        if collect_route_records:
+            metrics["_route_records"] = route_records
         return metrics
 
     def _classification_metrics(self, predictions: List[int], targets: List[int]) -> Dict[str, float]:
@@ -250,8 +369,23 @@ class BaseFederatedServer:
         self.writer.add_scalar(f"hard_accuracy/{prefix}", metrics.hard_accuracy, metrics.round_idx)
         self.writer.add_scalar(f"invocation_rate/{prefix}", metrics.invocation_rate, metrics.round_idx)
 
-        # Also log grouped comparison panes so multiple algorithms appear in one TensorBoard chart.
-        self.writer.add_scalars("compare/loss", {prefix: metrics.avg_client_loss}, metrics.round_idx)
-        self.writer.add_scalars("compare/accuracy", {prefix: metrics.routed_accuracy}, metrics.round_idx)
-        self.writer.add_scalars("compare/hard_accuracy", {prefix: metrics.hard_accuracy}, metrics.round_idx)
-        self.writer.add_scalars("compare/invocation_rate", {prefix: metrics.invocation_rate}, metrics.round_idx)
+        # Keep comparison tags stable across separate runs so TensorBoard can overlay
+        # FedAvg/FedProx/FedEGS* directly in the same chart without creating extra pseudo-runs.
+        self.writer.add_scalar("compare/loss", metrics.avg_client_loss, metrics.round_idx)
+        self.writer.add_scalar("compare/accuracy", metrics.routed_accuracy, metrics.round_idx)
+        self.writer.add_scalar("compare/hard_accuracy", metrics.hard_accuracy, metrics.round_idx)
+        self.writer.add_scalar("compare/invocation_rate", metrics.invocation_rate, metrics.round_idx)
+
+    def _log_auxiliary_accuracy_metrics(
+        self,
+        prefix: str,
+        round_idx: int,
+        expert_accuracy: float,
+        general_accuracy: float,
+    ) -> None:
+        if self.writer is None:
+            return
+        self.writer.add_scalar(f"expert_accuracy/{prefix}", expert_accuracy, round_idx)
+        self.writer.add_scalar(f"general_accuracy/{prefix}", general_accuracy, round_idx)
+        self.writer.add_scalar("compare/expert_accuracy", expert_accuracy, round_idx)
+        self.writer.add_scalar("compare/general_accuracy", general_accuracy, round_idx)
