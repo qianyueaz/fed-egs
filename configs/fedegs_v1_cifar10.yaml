@@ -1,0 +1,52 @@
+experiment_name: compare_fedegs_v1_cifar10
+output_dir: ./artifacts
+
+dataset:
+  name: cifar10
+  root: ./data
+  partition_strategy: difficulty_skewed
+  num_clients: 20
+  simple_clients: 10
+  complex_clients: 10
+  hard_ratio: 0.30
+  simple_easy_ratio: 0.90
+  complex_easy_ratio: 0.30
+  batch_size: 128
+  num_workers: 0
+  difficulty_checkpoint:
+  partition_cache_name: client_partitions.json
+  public_dataset_size: 1000
+  public_split_strategy: random
+
+federated:
+  server_algorithm: fedegs
+  client_algorithm: sgd_expert_local
+  compare_algorithms: []
+  sequential_simulation: true
+  rounds: 50
+  clients_per_round: 10
+  local_epochs: 5
+  local_lr: 0.01
+  local_momentum: 0.9
+  local_weight_decay: 0.0005
+  prox_mu: 0.001
+  distill_epochs: 2
+  distill_lr: 0.01
+  distill_temperature: 2.0
+  device: cuda
+  seed: 42
+
+model:
+  architecture: width_scalable_resnet18
+  num_classes: 10
+  general_width: 1.0
+  expert_width: 0.25
+  expert_base_channels: 32
+  baseline_architecture: width_scalable_resnet18
+  baseline_width: 1.0
+  baseline_base_channels: 32
+
+inference:
+  routing_policy: dual_threshold_general_fallback
+  high_threshold: 0.85
+  low_threshold: 0.30

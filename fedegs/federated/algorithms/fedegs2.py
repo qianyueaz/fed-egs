@@ -107,8 +107,12 @@ class FedEGS2Server(BaseFederatedServer):
 
             if self.writer is not None:
                 self.writer.add_scalar("distill_loss/fedegs2", distill_loss, round_idx)
-                self.writer.add_scalar("accuracy/fedegs2_expert", expert_eval["aggregate"]["accuracy"], round_idx)
-                self.writer.add_scalar("accuracy/fedegs2_general", general_eval["aggregate"]["accuracy"], round_idx)
+                self._log_auxiliary_accuracy_metrics(
+                    "fedegs2",
+                    round_idx,
+                    expert_eval["aggregate"]["accuracy"],
+                    general_eval["aggregate"]["accuracy"],
+                )
 
             self._log_round_metrics("fedegs2", round_metrics)
             metrics.append(round_metrics)
@@ -117,7 +121,12 @@ class FedEGS2Server(BaseFederatedServer):
         return metrics
 
     def evaluate_baselines(self, test_dataset: Dataset):
-        routed_eval = self._evaluate_predictor_on_client_tests(self._predict_routed, prefix="fedegs2_final_routed")
+        route_export_path = self._build_route_export_path("fedegs2_final_routed")
+        routed_eval = self._evaluate_predictor_on_client_tests(
+            self._predict_routed,
+            prefix="fedegs2_final_routed",
+            route_export_path=route_export_path,
+        )
         expert_eval = self._evaluate_predictor_on_client_tests(self._predict_expert_only, prefix="fedegs2_final_expert")
         general_eval = self._evaluate_predictor_on_client_tests(self._predict_general_only, prefix="fedegs2_final_general")
         final_loss = self.last_history[-1].avg_client_loss if self.last_history else 0.0
@@ -146,6 +155,9 @@ class FedEGS2Server(BaseFederatedServer):
             "memory_mb": {
                 "expert": model_memory_mb(next(iter(self.clients.values())).expert_model),
                 "general": model_memory_mb(self.general_model),
+            },
+            "artifacts": {
+                "route_csv": str(route_export_path),
             },
         }
 
@@ -203,16 +215,4 @@ class FedEGS2Server(BaseFederatedServer):
 
     def _predict_routed(self, client_id, images, indices):
         client = self.clients[client_id]
-        client.expert_model.eval()
-        self.general_model.eval()
-        expert_logits = client.expert_model(images)
-        expert_probs = torch.softmax(expert_logits, dim=1)
-        expert_confidence, expert_prediction = torch.max(expert_probs, dim=1)
-        use_expert_mask = expert_confidence > self.config.inference.high_threshold
-        predictions = expert_prediction.clone()
-        invoked_general = 0
-        if (~use_expert_mask).any():
-            general_logits = self.general_model(images[~use_expert_mask])
-            predictions[~use_expert_mask] = torch.argmax(general_logits, dim=1)
-            invoked_general = int((~use_expert_mask).sum().item())
-        return predictions, invoked_general
+        return self._dual_threshold_route(client.expert_model, self.general_model, images)
