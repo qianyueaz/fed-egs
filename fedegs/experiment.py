@@ -5,7 +5,7 @@ from fedegs.federated import create_federated_server
 
 
 def run_experiment_suite(config, data_bundle, data_module, writer=None) -> Tuple[List[object], Dict[str, object]]:
-    primary_history, primary_result = _run_single_algorithm(
+    primary_history, primary_result = run_single_algorithm(
         algorithm_name=config.federated.server_algorithm,
         config=config,
         data_bundle=data_bundle,
@@ -19,7 +19,7 @@ def run_experiment_suite(config, data_bundle, data_module, writer=None) -> Tuple
         normalized = algorithm_name.lower()
         if normalized in seen:
             continue
-        _, result = _run_single_algorithm(
+        _, result = run_single_algorithm(
             algorithm_name=algorithm_name,
             config=config,
             data_bundle=data_bundle,
@@ -36,7 +36,7 @@ def run_experiment_suite(config, data_bundle, data_module, writer=None) -> Tuple
     return primary_history, suite
 
 
-def _run_single_algorithm(algorithm_name: str, config, data_bundle, data_module, writer=None):
+def run_single_algorithm(algorithm_name: str, config, data_bundle, data_module, writer=None):
     run_config = copy.deepcopy(config)
     run_config.federated.server_algorithm = algorithm_name
     server = create_federated_server(

@@ -46,6 +46,8 @@ class FederatedConfig:
     distill_epochs: int = 1
     distill_lr: float = 0.001
     distill_temperature: float = 2.0
+    distill_alpha: float = 0.5
+    prototype_weight: float = 0.1
     device: str = "cuda"
     seed: int = 42
 
