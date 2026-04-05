@@ -139,6 +139,12 @@ def _resolve_override_target(config: ExperimentConfig, key: str):
         "output_dir": (config, "output_dir"),
         "experiment_name": (config, "experiment_name"),
         "prox_mu": (config.federated, "prox_mu"),
+        "server_algorithm": (config.federated, "server_algorithm"),
+        "distill_alpha": (config.federated, "distill_alpha"),
+        "prototype_weight": (config.federated, "prototype_weight"),
+        "distill_temperature": (config.federated, "distill_temperature"),
+        "distill_lr": (config.federated, "distill_lr"),
+        "distill_epochs": (config.federated, "distill_epochs"),
     }
     return mapping[key]
 
