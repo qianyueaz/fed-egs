@@ -372,12 +372,13 @@ class BaseFederatedServer:
         self.writer.add_scalar(f"hard_accuracy/{prefix}", metrics.hard_accuracy, metrics.round_idx)
         self.writer.add_scalar(f"invocation_rate/{prefix}", metrics.invocation_rate, metrics.round_idx)
 
-        # Comparison tags use the same group name so TensorBoard groups them in
-        # one chart, but each algorithm gets its own line via the prefix suffix.
-        self.writer.add_scalar(f"compare_loss/{prefix}", metrics.avg_client_loss, metrics.round_idx)
-        self.writer.add_scalar(f"compare_accuracy/{prefix}", metrics.routed_accuracy, metrics.round_idx)
-        self.writer.add_scalar(f"compare_hard_accuracy/{prefix}", metrics.hard_accuracy, metrics.round_idx)
-        self.writer.add_scalar(f"compare_invocation_rate/{prefix}", metrics.invocation_rate, metrics.round_idx)
+        # Comparison tags must be identical across runs. TensorBoard separates
+        # lines by run; adding the algorithm to the tag creates separate cards
+        # instead of one overlaid comparison chart.
+        self.writer.add_scalar("compare/loss", metrics.avg_client_loss, metrics.round_idx)
+        self.writer.add_scalar("compare/routed_accuracy", metrics.routed_accuracy, metrics.round_idx)
+        self.writer.add_scalar("compare/hard_accuracy", metrics.hard_accuracy, metrics.round_idx)
+        self.writer.add_scalar("compare/invocation_rate", metrics.invocation_rate, metrics.round_idx)
 
     def _log_auxiliary_accuracy_metrics(
         self,
@@ -390,5 +391,5 @@ class BaseFederatedServer:
             return
         self.writer.add_scalar(f"expert_accuracy/{prefix}", expert_accuracy, round_idx)
         self.writer.add_scalar(f"general_accuracy/{prefix}", general_accuracy, round_idx)
-        self.writer.add_scalar(f"compare_expert_accuracy/{prefix}", expert_accuracy, round_idx)
-        self.writer.add_scalar(f"compare_general_accuracy/{prefix}", general_accuracy, round_idx)
+        self.writer.add_scalar("compare/expert_accuracy", expert_accuracy, round_idx)
+        self.writer.add_scalar("compare/general_accuracy", general_accuracy, round_idx)

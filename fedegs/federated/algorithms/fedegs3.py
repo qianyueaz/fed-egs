@@ -17,10 +17,11 @@ Architecture (v3 rewrite — five core improvements):
    80% of the theoretical maximum are hard-zeroed, eliminating pure-noise
    contributions from Non-IID clients.
 
-4. **EMA prototype memory bank** — the server maintains a persistent
-   ``global_class_means`` tensor that is updated with exponential moving
-   average (momentum 0.9) each batch, smoothing out per-batch class sampling
-   noise in the prototype regularisation loss.
+4. **Live-gradient prototype regularisation** — the proto loss uses the
+   current batch's class mean logits (with gradient) directly against the
+   stable client-uploaded prototypes.  No EMA needed since proto_target is
+   already computed over full local datasets.  Proto loss is skipped when
+   Mixup is active to avoid feature pollution from blended logits.
 
 5. **Persistent server optimizer** — the SGD optimizer for the general model
    is created once in ``__init__`` and reused across all federated rounds,
@@ -139,17 +140,16 @@ class FedEGS3Server(BaseFederatedServer):
         self.public_eval_loader = self.data_module.make_loader(self.public_dataset, shuffle=False)
         self.last_history: List[RoundMetrics] = []
 
-        # ---- 改造四：EMA prototype memory bank ----
-        self.global_class_means = torch.zeros(num_classes, num_classes, device=self.device)
-        self.class_means_initialized = torch.zeros(num_classes, dtype=torch.bool, device=self.device)
-
-        # ---- 改造五：persistent server optimizer ----
+        # ---- persistent server optimizer (reused across all rounds) ----
         self.server_optimizer = torch.optim.SGD(
             self.general_model.parameters(),
             lr=config.federated.distill_lr,
             momentum=config.federated.local_momentum,
             weight_decay=config.federated.local_weight_decay,
         )
+
+        # ---- eval client cache (avoids redundant load_state_dict per batch) ----
+        self._current_eval_client_id: Optional[str] = None
 
     # ---- training loop ----------------------------------------------------
 
@@ -245,6 +245,9 @@ class FedEGS3Server(BaseFederatedServer):
         client.state_dict_cpu = {
             k: v.detach().cpu().clone() for k, v in self.expert_workbench.state_dict().items()
         }
+
+        # Invalidate eval cache since workbench was modified
+        self._current_eval_client_id = None
 
         # Free GPU cache between clients
         if torch.cuda.is_available():
@@ -357,37 +360,30 @@ class FedEGS3Server(BaseFederatedServer):
     # ---- 改造三：熵值加权聚合 ----
 
     def _aggregate_public_logits(self, updates: List[FedEGS3ClientUpdate]) -> torch.Tensor:
-        """Entropy-weighted logit aggregation with hard noise cutoff.
+        """Entropy-weighted logit aggregation with smooth exponential decay.
 
-        1. Temperature-smooth each client's logits (T=2.0 hardcoded).
+        1. Temperature-smooth each client's logits (T=2.0).
         2. Compute per-sample Shannon entropy.
-        3. Zero-out samples above 80% of max entropy (pure noise).
-        4. Weight = num_samples * (1 - normalized_entropy).
+        3. Weight = num_samples * exp(-beta * normalized_entropy).
+           High-entropy (noisy) samples get exponentially suppressed without
+           the instability of a hard cutoff threshold.
         """
         num_classes = updates[0].public_logits.size(1)
-        max_entropy = math.log(num_classes)  # ln(C), maximum possible entropy
-        entropy_cutoff = 0.8 * max_entropy
+        max_entropy = math.log(num_classes)
         smooth_temp = 2.0
+        beta = 5.0  # decay steepness: exp(-5*1.0) ≈ 0.007 for max-entropy samples
 
         aggregate = torch.zeros_like(updates[0].public_logits)
         weight_sum = torch.zeros(updates[0].public_logits.size(0), 1)
 
         for u in updates:
-            # Temperature-smoothed probabilities
             probs = torch.softmax(u.public_logits / smooth_temp, dim=1)
-
-            # Shannon entropy per sample: -sum(p * log(p))
             log_probs = torch.log(probs.clamp(min=1e-8))
-            entropy = -(probs * log_probs).sum(dim=1, keepdim=True)  # [N, 1]
-
-            # Normalized entropy in [0, 1]
+            entropy = -(probs * log_probs).sum(dim=1, keepdim=True)
             norm_entropy = entropy / max_entropy
 
-            # Hard cutoff: zero weight for samples above threshold
-            mask = (entropy.squeeze(1) <= entropy_cutoff).float().unsqueeze(1)  # [N, 1]
-
-            # Weight = num_samples * (1 - norm_entropy) * mask
-            sample_weight = float(u.num_samples) * (1.0 - norm_entropy) * mask
+            # Smooth exponential decay: no cliff, continuously differentiable
+            sample_weight = float(u.num_samples) * torch.exp(-beta * norm_entropy)
 
             aggregate += u.public_logits * sample_weight
             weight_sum += sample_weight
@@ -426,16 +422,18 @@ class FedEGS3Server(BaseFederatedServer):
         teacher_logits: torch.Tensor,
         global_prototypes: Dict[int, torch.Tensor],
     ) -> float:
-        """Distill with CE + KL + EMA-smoothed prototype regularisation.
+        """Distill with CE + KL + prototype regularisation.
 
-        Uses the persistent ``self.server_optimizer`` (改造五) and updates
-        ``self.global_class_means`` with EMA (改造四) for smooth proto loss.
+        Uses the persistent ``self.server_optimizer`` (改造五).
+        Proto loss uses live batch means (with gradients) directly against
+        the stable client-uploaded prototypes — no EMA needed since the
+        proto_target is already computed over full local datasets.
+        Proto loss is skipped when Mixup is active to avoid feature pollution.
         """
         temperature = self.config.federated.distill_temperature
         prototype_weight = getattr(self.config.federated, "prototype_weight", 0.01)
         server_ce_weight = getattr(self.config.federated, "server_ce_weight", 0.5)
         mixup_alpha = getattr(self.config.federated, "server_mixup_alpha", 0.4)
-        ema_momentum = 0.9
 
         num_classes = self.config.model.num_classes
         proto_target = torch.zeros(num_classes, num_classes, device=self.device)
@@ -459,20 +457,20 @@ class FedEGS3Server(BaseFederatedServer):
                 targets = targets.to(self.device)
 
                 # Mixup
+                is_mixed = False
                 if mixup_alpha > 0 and batch_size > 1:
                     lam = float(torch.distributions.Beta(mixup_alpha, mixup_alpha).sample())
                     lam = max(lam, 1.0 - lam)
                     perm = torch.randperm(batch_size, device=self.device)
                     images_mixed = lam * images + (1.0 - lam) * images[perm]
-                    batch_teacher_mixed = lam * batch_teacher + (1.0 - lam) * batch_teacher[perm]
                     targets_a, targets_b = targets, targets[perm]
+                    is_mixed = True
                 else:
                     images_mixed = images
-                    batch_teacher_mixed = batch_teacher
                     targets_a, targets_b = targets, targets
                     lam = 1.0
+                    perm = None
 
-                # 改造五：use persistent optimizer
                 self.server_optimizer.zero_grad(set_to_none=True)
                 student_logits = self.general_model(images_mixed)
 
@@ -481,44 +479,44 @@ class FedEGS3Server(BaseFederatedServer):
                     + (1.0 - lam) * F.cross_entropy(student_logits, targets_b)
                 )
 
+                # KL distillation: mix in probability space, not logit space.
+                # Softmax is nonlinear: softmax(λA + (1-λ)B) ≠ λ·softmax(A) + (1-λ)·softmax(B)
+                # Mixing logits destroys the dark knowledge encoded in temperature scaling.
+                if is_mixed and perm is not None:
+                    prob_a = F.softmax(batch_teacher / temperature, dim=1)
+                    prob_b = F.softmax(batch_teacher[perm] / temperature, dim=1)
+                    teacher_probs_target = lam * prob_a + (1.0 - lam) * prob_b
+                else:
+                    teacher_probs_target = F.softmax(batch_teacher / temperature, dim=1)
+
                 kd_loss = F.kl_div(
                     F.log_softmax(student_logits / temperature, dim=1),
-                    F.softmax(batch_teacher_mixed / temperature, dim=1),
+                    teacher_probs_target,
                     reduction="batchmean",
                 ) * (temperature ** 2)
 
-                # 改造四：EMA update of global_class_means, then compute proto loss
-                with torch.no_grad():
+                # Proto loss: live batch mean (WITH gradient) vs stable client prototypes.
+                # Skipped when Mixup is active to avoid feature pollution from blended logits.
+                proto_loss = torch.tensor(0.0, device=self.device)
+                if prototype_weight > 0 and proto_mask.sum() > 0 and not is_mixed:
+                    classes_in_batch = 0
                     for cls in range(num_classes):
-                        cls_mask = targets_a == cls
+                        if proto_mask[cls] == 0:
+                            continue
+                        cls_mask = targets == cls
                         if not cls_mask.any():
                             continue
-                        batch_cls_mean = student_logits[cls_mask].mean(dim=0).detach()
-                        if self.class_means_initialized[cls]:
-                            self.global_class_means[cls] = (
-                                ema_momentum * self.global_class_means[cls]
-                                + (1.0 - ema_momentum) * batch_cls_mean
-                            )
-                        else:
-                            self.global_class_means[cls] = batch_cls_mean
-                            self.class_means_initialized[cls] = True
-
-                # Proto loss: EMA memory vs. client prototypes
-                proto_loss = torch.tensor(0.0, device=self.device)
-                classes_active = 0
-                if prototype_weight > 0 and proto_mask.sum() > 0:
-                    for cls in range(num_classes):
-                        if proto_mask[cls] == 0 or not self.class_means_initialized[cls]:
-                            continue
+                        # NO detach — gradient flows through to general_model
+                        cls_mean_logit = student_logits[cls_mask].mean(dim=0)
                         cos_sim = F.cosine_similarity(
-                            self.global_class_means[cls].unsqueeze(0),
+                            cls_mean_logit.unsqueeze(0),
                             proto_target[cls].unsqueeze(0),
                         )
                         proto_loss = proto_loss + (1.0 - cos_sim.squeeze())
-                        classes_active += 1
+                        classes_in_batch += 1
 
-                    if classes_active > 0:
-                        proto_loss = proto_loss / classes_active
+                    if classes_in_batch > 0:
+                        proto_loss = proto_loss / classes_in_batch
 
                 loss = (
                     server_ce_weight * ce_loss
@@ -580,19 +578,23 @@ class FedEGS3Server(BaseFederatedServer):
 
     # ---- predictors (use workbench for evaluation) ----
 
+    def _load_expert_for_eval(self, client_id: str) -> None:
+        """Load client weights into workbench only if not already loaded."""
+        if self._current_eval_client_id != client_id:
+            self.expert_workbench.load_state_dict(self.clients[client_id].state_dict_cpu)
+            self.expert_workbench.eval()
+            self._current_eval_client_id = client_id
+
     def _predict_general_only(self, client_id, images, indices):
         self.general_model.eval()
         logits = self.general_model(images)
         return logits.argmax(dim=1), 0
 
     def _predict_expert_only(self, client_id, images, indices):
-        client = self.clients[client_id]
-        self.expert_workbench.load_state_dict(client.state_dict_cpu)
-        self.expert_workbench.eval()
+        self._load_expert_for_eval(client_id)
         logits = self.expert_workbench(images)
         return logits.argmax(dim=1), 0
 
     def _predict_routed(self, client_id, images, indices):
-        client = self.clients[client_id]
-        self.expert_workbench.load_state_dict(client.state_dict_cpu)
+        self._load_expert_for_eval(client_id)
         return self._dual_threshold_route(self.expert_workbench, self.general_model, images)

@@ -88,25 +88,24 @@ def run_single_algorithm(algorithm_name: str, config, data_bundle, data_module, 
     if writer is not None:
         metrics = result.get("metrics", {})
         summary_step = 0
-        tag_prefix = f"summary_{algorithm_name}"
         if "routed_accuracy" in metrics:
-            writer.add_scalar(f"{tag_prefix}/routed_accuracy", metrics["routed_accuracy"], summary_step)
+            writer.add_scalar("summary/routed_accuracy", metrics["routed_accuracy"], summary_step)
         elif "accuracy" in metrics:
-            writer.add_scalar(f"{tag_prefix}/routed_accuracy", metrics["accuracy"], summary_step)
+            writer.add_scalar("summary/routed_accuracy", metrics["accuracy"], summary_step)
         if "routed_hard_accuracy" in metrics:
-            writer.add_scalar(f"{tag_prefix}/hard_accuracy", metrics["routed_hard_accuracy"], summary_step)
+            writer.add_scalar("summary/hard_accuracy", metrics["routed_hard_accuracy"], summary_step)
         elif "hard_accuracy" in metrics:
-            writer.add_scalar(f"{tag_prefix}/hard_accuracy", metrics["hard_accuracy"], summary_step)
+            writer.add_scalar("summary/hard_accuracy", metrics["hard_accuracy"], summary_step)
         if "general_invocation_rate" in metrics:
-            writer.add_scalar(f"{tag_prefix}/invocation_rate", metrics["general_invocation_rate"], summary_step)
+            writer.add_scalar("summary/invocation_rate", metrics["general_invocation_rate"], summary_step)
         elif "invocation_rate" in metrics:
-            writer.add_scalar(f"{tag_prefix}/invocation_rate", metrics["invocation_rate"], summary_step)
+            writer.add_scalar("summary/invocation_rate", metrics["invocation_rate"], summary_step)
         if "expert_only_accuracy" in metrics:
-            writer.add_scalar(f"{tag_prefix}/expert_accuracy", metrics["expert_only_accuracy"], summary_step)
+            writer.add_scalar("summary/expert_accuracy", metrics["expert_only_accuracy"], summary_step)
         if "general_only_accuracy" in metrics:
-            writer.add_scalar(f"{tag_prefix}/general_accuracy", metrics["general_only_accuracy"], summary_step)
+            writer.add_scalar("summary/general_accuracy", metrics["general_only_accuracy"], summary_step)
         if "final_training_loss" in metrics:
-            writer.add_scalar(f"{tag_prefix}/final_training_loss", metrics["final_training_loss"], summary_step)
+            writer.add_scalar("summary/final_training_loss", metrics["final_training_loss"], summary_step)
     return history, result
 
 
@@ -142,10 +141,14 @@ def _make_comparison_writer(config, algorithm_name: str, primary_writer) -> Opti
     primary_name = primary_dir.name
     primary_algo = config.federated.server_algorithm
 
-    # Try to replace the algorithm name in the directory name
-    comparison_name = primary_name.replace(primary_algo, algorithm_name, 1)
-    if comparison_name == primary_name:
-        # Fallback: just append
+    # Replace only the trailing "_<algorithm>_" segment. The experiment name
+    # itself often includes the primary algorithm token, so replace(..., 1)
+    # corrupts the run name and produces misleading TensorBoard run labels.
+    marker = f"_{primary_algo}_"
+    if marker in primary_name:
+        base_name, suffix = primary_name.rsplit(marker, 1)
+        comparison_name = f"{base_name}_{algorithm_name}_{suffix}"
+    else:
         comparison_name = f"{primary_name}_{algorithm_name}"
 
     comparison_dir = parent_dir / comparison_name
