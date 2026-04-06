@@ -1,26 +1,35 @@
 """FedEGS-3: Mutual Knowledge Distillation with Class Prototypes.
 
-Extends FedEGS-2 with two key optimizations:
+Architecture (v3 rewrite — five core improvements):
 
-1. **Local knowledge distillation** — the server's general model acts as a
-   teacher during client-side expert training.  The expert's loss becomes:
-       total = CE(expert_logits, hard_label) + alpha * KL(expert_logits, teacher_soft_label)
-   The general model is only used for forward passes on the client (no
-   backpropagation), keeping the overhead minimal on edge devices.
+1. **Single-workbench GPU model** — only one SmallCNN lives on GPU at a time.
+   Each client stores its weights as a CPU state_dict.  Before training, the
+   server loads the client's weights into the shared workbench; afterward it
+   copies the updated weights back to CPU.  This caps GPU memory at O(1)
+   regardless of client count.
 
-2. **Class-wise logit prototypes** — each client computes per-class average
-   logits over its local data and uploads them alongside the public-set logits.
-   The server aggregates prototypes across clients and adds a regularisation
-   term when distilling the general model, encouraging its class-level outputs
-   to align with the true local distributions reported by all clients.
+2. **In-train prototype interception** — prototypes are harvested from the
+   *last epoch* of local training for free, using the logits that are already
+   computed for the CE/KD loss.  No extra forward pass.
 
-The bidirectional knowledge flow creates a virtuous cycle: a stronger general
-model produces better soft labels → experts improve → experts produce better
-public logits and prototypes → general model improves further.
+3. **Entropy-weighted logit aggregation** — replaces max-confidence weighting
+   with temperature-smoothed Shannon entropy.  Samples whose entropy exceeds
+   80% of the theoretical maximum are hard-zeroed, eliminating pure-noise
+   contributions from Non-IID clients.
+
+4. **EMA prototype memory bank** — the server maintains a persistent
+   ``global_class_means`` tensor that is updated with exponential moving
+   average (momentum 0.9) each batch, smoothing out per-batch class sampling
+   noise in the prototype regularisation loss.
+
+5. **Persistent server optimizer** — the SGD optimizer for the general model
+   is created once in ``__init__`` and reused across all federated rounds,
+   preserving momentum buffers and accelerating convergence.
 """
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+import math
 
 import torch
 import torch.nn as nn
@@ -46,172 +55,35 @@ class FedEGS3ClientUpdate:
     num_samples: int
     loss: float
     public_logits: torch.Tensor
-    class_prototypes: Dict[int, torch.Tensor]  # class_id -> avg logit vector
-    class_counts: Dict[int, int]               # class_id -> sample count
+    class_prototypes: Dict[int, torch.Tensor]
+    class_counts: Dict[int, int]
 
 
 # ---------------------------------------------------------------------------
-# Client
+# Client  (改造一：瘦身为数据容器，不持有 GPU 模型)
 # ---------------------------------------------------------------------------
 
-class FedEGS3Client(BaseFederatedClient):
-    """Client that trains an expert with local KD from the general model."""
+class FedEGS3Client:
+    """Lightweight client — holds only a CPU state_dict, no GPU model."""
 
     def __init__(
         self,
         client_id: str,
         dataset: Dataset,
         num_classes: int,
-        device: str,
         config,
         data_module,
+        initial_state_dict: Dict[str, torch.Tensor],
     ) -> None:
-        super().__init__(client_id, dataset, device)
+        self.client_id = client_id
+        self.dataset = dataset
+        self.num_classes = num_classes
         self.config = config
         self.data_module = data_module
-        self.num_classes = num_classes
-        self.expert_model = SmallCNN(
-            num_classes=num_classes,
-            base_channels=config.model.expert_base_channels,
-        ).to(self.device)
-
-    # ---- public API -------------------------------------------------------
-
-    def train(
-        self,
-        general_model: nn.Module,
-        public_loader: DataLoader,
-        round_idx: int = 1,
-    ) -> FedEGS3ClientUpdate:
-        """Run one round of local training with mutual distillation."""
-        local_loader = self.data_module.make_loader(self.dataset, shuffle=True)
-
-        # Step 1: train expert with combined CE + KD loss
-        loss = self._train_with_distillation(general_model, local_loader, round_idx)
-
-        # Step 2: generate public-set logits (same as FedEGS-2)
-        public_logits = self._predict_public_logits(public_loader)
-
-        # Step 3: compute class-wise prototypes from local data
-        # Use a fresh non-shuffled loader to ensure deterministic full coverage
-        proto_loader = self.data_module.make_loader(self.dataset, shuffle=False)
-        class_prototypes, class_counts = self._compute_class_prototypes(proto_loader)
-
-        return FedEGS3ClientUpdate(
-            client_id=self.client_id,
-            num_samples=len(self.dataset),
-            loss=loss,
-            public_logits=public_logits,
-            class_prototypes=class_prototypes,
-            class_counts=class_counts,
-        )
-
-    # ---- internal ---------------------------------------------------------
-
-    def _train_with_distillation(
-        self,
-        teacher_model: nn.Module,
-        loader: DataLoader,
-        round_idx: int = 1,
-    ) -> float:
-        """Train the expert model with CE + alpha * KL(expert, teacher).
-
-        During the first ``kd_warmup_rounds`` rounds the teacher (general model)
-        is too weak to provide useful guidance, so ``current_alpha`` is forced
-        to 0 — the expert trains with pure CE, and the teacher forward pass is
-        skipped entirely to save compute.
-        """
-        distill_alpha: float = getattr(self.config.federated, "distill_alpha", 0.5)
-        warmup_rounds: int = getattr(self.config.federated, "kd_warmup_rounds", 10)
-        temperature: float = self.config.federated.distill_temperature
-
-        # Dynamic alpha: cut off distillation during warmup
-        current_alpha = distill_alpha if round_idx > warmup_rounds else 0.0
-
-        optimizer = torch.optim.SGD(
-            self.expert_model.parameters(),
-            lr=self.config.federated.local_lr,
-            momentum=self.config.federated.local_momentum,
-            weight_decay=self.config.federated.local_weight_decay,
-        )
-        criterion = nn.CrossEntropyLoss()
-        self.expert_model.train()
-        if current_alpha > 0:
-            teacher_model.eval()
-
-        total_loss = 0.0
-        total_batches = 0
-
-        for _ in range(self.config.federated.local_epochs):
-            for images, targets, _ in loader:
-                images = images.to(self.device)
-                targets = targets.to(self.device)
-
-                # Teacher forward — only when alpha is active
-                with torch.no_grad():
-                    teacher_logits = teacher_model(images) if current_alpha > 0 else None
-
-                # Student forward
-                optimizer.zero_grad(set_to_none=True)
-                student_logits = self.expert_model(images)
-
-                # Hard-label loss
-                ce_loss = criterion(student_logits, targets)
-
-                # Soft-label distillation loss (skipped during warmup)
-                if current_alpha > 0 and teacher_logits is not None:
-                    kd_loss = F.kl_div(
-                        F.log_softmax(student_logits / temperature, dim=1),
-                        F.softmax(teacher_logits / temperature, dim=1),
-                        reduction="batchmean",
-                    ) * (temperature ** 2)
-                else:
-                    kd_loss = torch.tensor(0.0, device=self.device)
-
-                loss = (1.0 - current_alpha) * ce_loss + current_alpha * kd_loss
-                loss.backward()
-                optimizer.step()
-
-                total_loss += float(loss.detach().cpu().item())
-                total_batches += 1
-
-        return total_loss / max(total_batches, 1)
-
-    def _predict_public_logits(self, public_loader: DataLoader) -> torch.Tensor:
-        self.expert_model.eval()
-        outputs: List[torch.Tensor] = []
-        with torch.no_grad():
-            for images, _, _ in public_loader:
-                images = images.to(self.device)
-                outputs.append(self.expert_model(images).detach().cpu())
-        return torch.cat(outputs, dim=0)
-
-    def _compute_class_prototypes(
-        self,
-        loader: DataLoader,
-    ) -> tuple[Dict[int, torch.Tensor], Dict[int, int]]:
-        """Compute per-class average logit vectors over local data."""
-        self.expert_model.eval()
-        accumulators: Dict[int, torch.Tensor] = {}
-        counts: Dict[int, int] = {}
-
-        with torch.no_grad():
-            for images, targets, _ in loader:
-                images = images.to(self.device)
-                logits = self.expert_model(images).detach().cpu()
-                for logit, target in zip(logits, targets):
-                    cls = int(target.item())
-                    if cls not in accumulators:
-                        accumulators[cls] = torch.zeros(self.num_classes)
-                        counts[cls] = 0
-                    accumulators[cls] += logit
-                    counts[cls] += 1
-
-        prototypes: Dict[int, torch.Tensor] = {}
-        for cls in accumulators:
-            prototypes[cls] = accumulators[cls] / counts[cls]
-
-        return prototypes, counts
+        # Store weights on CPU — never on GPU
+        self.state_dict_cpu: Dict[str, torch.Tensor] = {
+            k: v.cpu().clone() for k, v in initial_state_dict.items()
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +91,7 @@ class FedEGS3Client(BaseFederatedClient):
 # ---------------------------------------------------------------------------
 
 class FedEGS3Server(BaseFederatedServer):
-    """Server with prototype-regularised distillation."""
+    """Server with single-workbench training and EMA prototype memory."""
 
     def __init__(
         self,
@@ -232,32 +104,52 @@ class FedEGS3Server(BaseFederatedServer):
         public_dataset: Optional[Dataset] = None,
     ) -> None:
         super().__init__(
-            config,
-            client_datasets,
-            client_test_datasets,
-            data_module,
-            test_hard_indices,
-            writer,
+            config, client_datasets, client_test_datasets,
+            data_module, test_hard_indices, writer,
             public_dataset=public_dataset,
         )
         if self.public_dataset is None or len(self.public_dataset) == 0:
             raise ValueError("FedEGS-3 requires a non-empty public distillation dataset.")
 
+        num_classes = config.model.num_classes
+
+        # ---- GPU models (only these two live on GPU) ----
         self.general_model = WidthScalableResNet(
             width_factor=config.model.general_width,
-            num_classes=config.model.num_classes,
+            num_classes=num_classes,
         ).to(self.device)
 
+        # Single expert workbench — shared across all clients
+        self.expert_workbench = SmallCNN(
+            num_classes=num_classes,
+            base_channels=config.model.expert_base_channels,
+        ).to(self.device)
+
+        # ---- Lightweight client objects (CPU only) ----
+        # Generate one random init and share it as the starting point
+        init_state = {k: v.cpu().clone() for k, v in self.expert_workbench.state_dict().items()}
         self.clients = {
-            client_id: FedEGS3Client(
-                client_id, dataset, config.model.num_classes,
-                config.federated.device, config, data_module,
+            cid: FedEGS3Client(
+                cid, ds, num_classes, config, data_module,
+                initial_state_dict=init_state,
             )
-            for client_id, dataset in client_datasets.items()
+            for cid, ds in client_datasets.items()
         }
 
         self.public_eval_loader = self.data_module.make_loader(self.public_dataset, shuffle=False)
         self.last_history: List[RoundMetrics] = []
+
+        # ---- 改造四：EMA prototype memory bank ----
+        self.global_class_means = torch.zeros(num_classes, num_classes, device=self.device)
+        self.class_means_initialized = torch.zeros(num_classes, dtype=torch.bool, device=self.device)
+
+        # ---- 改造五：persistent server optimizer ----
+        self.server_optimizer = torch.optim.SGD(
+            self.general_model.parameters(),
+            lr=config.federated.distill_lr,
+            momentum=config.federated.local_momentum,
+            weight_decay=config.federated.local_weight_decay,
+        )
 
     # ---- training loop ----------------------------------------------------
 
@@ -270,22 +162,15 @@ class FedEGS3Server(BaseFederatedServer):
 
             updates: List[FedEGS3ClientUpdate] = []
             for client_id in sampled_ids:
-                updates.append(
-                    self.clients[client_id].train(self.general_model, self.public_eval_loader, round_idx)
-                )
+                update = self._train_single_client(client_id, round_idx)
+                updates.append(update)
 
-            # Aggregate public logits (same as FedEGS-2)
             teacher_logits = self._aggregate_public_logits(updates)
-
-            # Aggregate class prototypes across sampled clients
             global_prototypes = self._aggregate_class_prototypes(updates)
-
-            # Distill general model with prototype regularisation
             distill_loss = self._distill_general_model(teacher_logits, global_prototypes)
 
             avg_loss = sum(u.loss for u in updates) / max(len(updates), 1)
 
-            # Evaluate
             expert_eval = self._evaluate_predictor_on_client_tests(
                 self._predict_expert_only, prefix="fedegs3-expert",
             )
@@ -311,10 +196,8 @@ class FedEGS3Server(BaseFederatedServer):
                 "fedegs3 round %d | local_loss=%.4f | distill_loss=%.4f "
                 "| routed_acc=%.4f | hard_acc=%.4f | invocation=%.4f | kd_alpha=%.2f%s",
                 round_idx, avg_loss, distill_loss,
-                aggregate["accuracy"],
-                aggregate["hard_accuracy"],
-                aggregate["invocation_rate"],
-                current_alpha,
+                aggregate["accuracy"], aggregate["hard_accuracy"],
+                aggregate["invocation_rate"], current_alpha,
                 "" if kd_active else " [warmup]",
             )
             LOGGER.info(
@@ -327,9 +210,6 @@ class FedEGS3Server(BaseFederatedServer):
             if self.writer is not None:
                 self.writer.add_scalar("distill_loss/fedegs3", distill_loss, round_idx)
                 self.writer.add_scalar("prototype/num_classes_covered", len(global_prototypes), round_idx)
-                self.writer.add_scalar("prototype/total_samples", sum(
-                    u.class_counts.get(c, 0) for u in updates for c in u.class_counts
-                ), round_idx)
                 self._log_auxiliary_accuracy_metrics(
                     "fedegs3", round_idx,
                     expert_eval["aggregate"]["accuracy"],
@@ -341,6 +221,315 @@ class FedEGS3Server(BaseFederatedServer):
 
         self.last_history = metrics
         return metrics
+
+    # ---- 改造一：单工作台客户端训练 ----
+
+    def _train_single_client(self, client_id: str, round_idx: int) -> FedEGS3ClientUpdate:
+        """Load client weights → train on workbench → save weights back to CPU."""
+        client = self.clients[client_id]
+
+        # Load this client's weights onto the GPU workbench
+        self.expert_workbench.load_state_dict(client.state_dict_cpu)
+
+        local_loader = client.data_module.make_loader(client.dataset, shuffle=True)
+
+        # Train (改造二: prototypes are harvested inside the last epoch)
+        loss, class_prototypes, class_counts = self._train_with_distillation(
+            self.expert_workbench, self.general_model, local_loader, round_idx,
+        )
+
+        # Public logits
+        public_logits = self._predict_expert_logits(self.expert_workbench)
+
+        # Save updated weights back to CPU
+        client.state_dict_cpu = {
+            k: v.detach().cpu().clone() for k, v in self.expert_workbench.state_dict().items()
+        }
+
+        # Free GPU cache between clients
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return FedEGS3ClientUpdate(
+            client_id=client_id,
+            num_samples=len(client.dataset),
+            loss=loss,
+            public_logits=public_logits,
+            class_prototypes=class_prototypes,
+            class_counts=class_counts,
+        )
+
+    # ---- 改造二：训练中截获原型 ----
+
+    def _train_with_distillation(
+        self,
+        expert_model: nn.Module,
+        teacher_model: nn.Module,
+        loader: DataLoader,
+        round_idx: int,
+    ) -> Tuple[float, Dict[int, torch.Tensor], Dict[int, int]]:
+        """Train expert with CE + KD.  Harvest prototypes from last epoch."""
+        distill_alpha = getattr(self.config.federated, "distill_alpha", 0.5)
+        warmup_rounds = getattr(self.config.federated, "kd_warmup_rounds", 10)
+        temperature = self.config.federated.distill_temperature
+        local_epochs = self.config.federated.local_epochs
+        num_classes = self.config.model.num_classes
+
+        current_alpha = distill_alpha if round_idx > warmup_rounds else 0.0
+
+        optimizer = torch.optim.SGD(
+            expert_model.parameters(),
+            lr=self.config.federated.local_lr,
+            momentum=self.config.federated.local_momentum,
+            weight_decay=self.config.federated.local_weight_decay,
+        )
+        criterion = nn.CrossEntropyLoss()
+        expert_model.train()
+        if current_alpha > 0:
+            teacher_model.eval()
+
+        total_loss = 0.0
+        total_batches = 0
+
+        # Prototype accumulators (only active in the last epoch)
+        proto_accum: Dict[int, torch.Tensor] = {}
+        proto_counts: Dict[int, int] = {}
+
+        for epoch in range(1, local_epochs + 1):
+            is_last_epoch = (epoch == local_epochs)
+
+            for images, targets, _ in loader:
+                images = images.to(self.device)
+                targets = targets.to(self.device)
+
+                with torch.no_grad():
+                    teacher_logits = teacher_model(images) if current_alpha > 0 else None
+
+                optimizer.zero_grad(set_to_none=True)
+                student_logits = expert_model(images)
+
+                ce_loss = criterion(student_logits, targets)
+
+                if current_alpha > 0 and teacher_logits is not None:
+                    kd_loss = F.kl_div(
+                        F.log_softmax(student_logits / temperature, dim=1),
+                        F.softmax(teacher_logits / temperature, dim=1),
+                        reduction="batchmean",
+                    ) * (temperature ** 2)
+                else:
+                    kd_loss = torch.tensor(0.0, device=self.device)
+
+                loss = (1.0 - current_alpha) * ce_loss + current_alpha * kd_loss
+                loss.backward()
+                optimizer.step()
+
+                total_loss += float(loss.detach().cpu().item())
+                total_batches += 1
+
+                # Intercept logits for prototype computation (last epoch only)
+                if is_last_epoch:
+                    detached = student_logits.detach().cpu()
+                    for logit, target in zip(detached, targets.cpu()):
+                        cls = int(target.item())
+                        if cls not in proto_accum:
+                            proto_accum[cls] = torch.zeros(num_classes)
+                            proto_counts[cls] = 0
+                        proto_accum[cls] += logit
+                        proto_counts[cls] += 1
+
+        # Finalize prototypes
+        prototypes: Dict[int, torch.Tensor] = {}
+        for cls in proto_accum:
+            prototypes[cls] = proto_accum[cls] / proto_counts[cls]
+
+        return total_loss / max(total_batches, 1), prototypes, proto_counts
+
+    def _predict_expert_logits(self, expert_model: nn.Module) -> torch.Tensor:
+        """Run expert on public set to get logits for server aggregation."""
+        expert_model.eval()
+        outputs: List[torch.Tensor] = []
+        with torch.no_grad():
+            for images, _, _ in self.public_eval_loader:
+                images = images.to(self.device)
+                outputs.append(expert_model(images).detach().cpu())
+        return torch.cat(outputs, dim=0)
+
+    # ---- 改造三：熵值加权聚合 ----
+
+    def _aggregate_public_logits(self, updates: List[FedEGS3ClientUpdate]) -> torch.Tensor:
+        """Entropy-weighted logit aggregation with hard noise cutoff.
+
+        1. Temperature-smooth each client's logits (T=2.0 hardcoded).
+        2. Compute per-sample Shannon entropy.
+        3. Zero-out samples above 80% of max entropy (pure noise).
+        4. Weight = num_samples * (1 - normalized_entropy).
+        """
+        num_classes = updates[0].public_logits.size(1)
+        max_entropy = math.log(num_classes)  # ln(C), maximum possible entropy
+        entropy_cutoff = 0.8 * max_entropy
+        smooth_temp = 2.0
+
+        aggregate = torch.zeros_like(updates[0].public_logits)
+        weight_sum = torch.zeros(updates[0].public_logits.size(0), 1)
+
+        for u in updates:
+            # Temperature-smoothed probabilities
+            probs = torch.softmax(u.public_logits / smooth_temp, dim=1)
+
+            # Shannon entropy per sample: -sum(p * log(p))
+            log_probs = torch.log(probs.clamp(min=1e-8))
+            entropy = -(probs * log_probs).sum(dim=1, keepdim=True)  # [N, 1]
+
+            # Normalized entropy in [0, 1]
+            norm_entropy = entropy / max_entropy
+
+            # Hard cutoff: zero weight for samples above threshold
+            mask = (entropy.squeeze(1) <= entropy_cutoff).float().unsqueeze(1)  # [N, 1]
+
+            # Weight = num_samples * (1 - norm_entropy) * mask
+            sample_weight = float(u.num_samples) * (1.0 - norm_entropy) * mask
+
+            aggregate += u.public_logits * sample_weight
+            weight_sum += sample_weight
+
+        aggregate /= weight_sum.clamp(min=1e-8)
+        return aggregate
+
+    def _aggregate_class_prototypes(
+        self,
+        updates: List[FedEGS3ClientUpdate],
+    ) -> Dict[int, torch.Tensor]:
+        accumulators: Dict[int, torch.Tensor] = {}
+        counts: Dict[int, int] = {}
+
+        for u in updates:
+            for cls, proto in u.class_prototypes.items():
+                n = u.class_counts.get(cls, 0)
+                if n == 0:
+                    continue
+                if cls not in accumulators:
+                    accumulators[cls] = torch.zeros_like(proto)
+                    counts[cls] = 0
+                accumulators[cls] += proto * n
+                counts[cls] += n
+
+        global_prototypes: Dict[int, torch.Tensor] = {}
+        for cls in accumulators:
+            global_prototypes[cls] = accumulators[cls] / counts[cls]
+
+        return global_prototypes
+
+    # ---- 改造四 + 五：EMA 记忆库 + 持久化优化器蒸馏 ----
+
+    def _distill_general_model(
+        self,
+        teacher_logits: torch.Tensor,
+        global_prototypes: Dict[int, torch.Tensor],
+    ) -> float:
+        """Distill with CE + KL + EMA-smoothed prototype regularisation.
+
+        Uses the persistent ``self.server_optimizer`` (改造五) and updates
+        ``self.global_class_means`` with EMA (改造四) for smooth proto loss.
+        """
+        temperature = self.config.federated.distill_temperature
+        prototype_weight = getattr(self.config.federated, "prototype_weight", 0.01)
+        server_ce_weight = getattr(self.config.federated, "server_ce_weight", 0.5)
+        mixup_alpha = getattr(self.config.federated, "server_mixup_alpha", 0.4)
+        ema_momentum = 0.9
+
+        num_classes = self.config.model.num_classes
+        proto_target = torch.zeros(num_classes, num_classes, device=self.device)
+        proto_mask = torch.zeros(num_classes, device=self.device)
+        for cls, proto in global_prototypes.items():
+            proto_target[cls] = proto.to(self.device)
+            proto_mask[cls] = 1.0
+
+        losses: List[float] = []
+        teacher_cursor = 0
+
+        for _ in range(self.config.federated.distill_epochs):
+            self.general_model.train()
+            teacher_cursor = 0
+
+            for images, targets, _ in self.public_eval_loader:
+                batch_size = images.size(0)
+                batch_teacher = teacher_logits[teacher_cursor: teacher_cursor + batch_size].to(self.device)
+                teacher_cursor += batch_size
+                images = images.to(self.device)
+                targets = targets.to(self.device)
+
+                # Mixup
+                if mixup_alpha > 0 and batch_size > 1:
+                    lam = float(torch.distributions.Beta(mixup_alpha, mixup_alpha).sample())
+                    lam = max(lam, 1.0 - lam)
+                    perm = torch.randperm(batch_size, device=self.device)
+                    images_mixed = lam * images + (1.0 - lam) * images[perm]
+                    batch_teacher_mixed = lam * batch_teacher + (1.0 - lam) * batch_teacher[perm]
+                    targets_a, targets_b = targets, targets[perm]
+                else:
+                    images_mixed = images
+                    batch_teacher_mixed = batch_teacher
+                    targets_a, targets_b = targets, targets
+                    lam = 1.0
+
+                # 改造五：use persistent optimizer
+                self.server_optimizer.zero_grad(set_to_none=True)
+                student_logits = self.general_model(images_mixed)
+
+                ce_loss = (
+                    lam * F.cross_entropy(student_logits, targets_a)
+                    + (1.0 - lam) * F.cross_entropy(student_logits, targets_b)
+                )
+
+                kd_loss = F.kl_div(
+                    F.log_softmax(student_logits / temperature, dim=1),
+                    F.softmax(batch_teacher_mixed / temperature, dim=1),
+                    reduction="batchmean",
+                ) * (temperature ** 2)
+
+                # 改造四：EMA update of global_class_means, then compute proto loss
+                with torch.no_grad():
+                    for cls in range(num_classes):
+                        cls_mask = targets_a == cls
+                        if not cls_mask.any():
+                            continue
+                        batch_cls_mean = student_logits[cls_mask].mean(dim=0).detach()
+                        if self.class_means_initialized[cls]:
+                            self.global_class_means[cls] = (
+                                ema_momentum * self.global_class_means[cls]
+                                + (1.0 - ema_momentum) * batch_cls_mean
+                            )
+                        else:
+                            self.global_class_means[cls] = batch_cls_mean
+                            self.class_means_initialized[cls] = True
+
+                # Proto loss: EMA memory vs. client prototypes
+                proto_loss = torch.tensor(0.0, device=self.device)
+                classes_active = 0
+                if prototype_weight > 0 and proto_mask.sum() > 0:
+                    for cls in range(num_classes):
+                        if proto_mask[cls] == 0 or not self.class_means_initialized[cls]:
+                            continue
+                        cos_sim = F.cosine_similarity(
+                            self.global_class_means[cls].unsqueeze(0),
+                            proto_target[cls].unsqueeze(0),
+                        )
+                        proto_loss = proto_loss + (1.0 - cos_sim.squeeze())
+                        classes_active += 1
+
+                    if classes_active > 0:
+                        proto_loss = proto_loss / classes_active
+
+                loss = (
+                    server_ce_weight * ce_loss
+                    + (1.0 - server_ce_weight) * kd_loss
+                    + prototype_weight * proto_loss
+                )
+                loss.backward()
+                self.server_optimizer.step()
+                losses.append(float(loss.detach().cpu().item()))
+
+        return sum(losses) / max(len(losses), 1)
 
     # ---- evaluation -------------------------------------------------------
 
@@ -381,7 +570,7 @@ class FedEGS3Server(BaseFederatedServer):
                 "general_only": general_eval["clients"],
             },
             "memory_mb": {
-                "expert": model_memory_mb(next(iter(self.clients.values())).expert_model),
+                "expert": model_memory_mb(self.expert_workbench),
                 "general": model_memory_mb(self.general_model),
             },
             "artifacts": {
@@ -389,172 +578,7 @@ class FedEGS3Server(BaseFederatedServer):
             },
         }
 
-    # ---- aggregation helpers ----------------------------------------------
-
-    def _aggregate_public_logits(self, updates: List[FedEGS3ClientUpdate]) -> torch.Tensor:
-        """Aggregate public-set logits with per-sample confidence weighting.
-
-        Instead of a flat sample-count average, each client's contribution to
-        each public sample is scaled by its prediction confidence (max softmax
-        probability).  Clients that are confident about a sample get more say;
-        clients that are guessing contribute less noise.
-        """
-        aggregate = torch.zeros_like(updates[0].public_logits)
-        weight_sum = torch.zeros(updates[0].public_logits.size(0), 1)
-
-        for u in updates:
-            probs = torch.softmax(u.public_logits, dim=1)
-            confidence, _ = torch.max(probs, dim=1, keepdim=True)  # [num_public, 1]
-            weight = float(u.num_samples) * confidence
-            aggregate += u.public_logits * weight
-            weight_sum += weight
-
-        aggregate /= weight_sum.clamp(min=1e-8)
-        return aggregate
-
-    def _aggregate_class_prototypes(
-        self,
-        updates: List[FedEGS3ClientUpdate],
-    ) -> Dict[int, torch.Tensor]:
-        """Weighted average of per-class prototypes across all sampled clients."""
-        accumulators: Dict[int, torch.Tensor] = {}
-        counts: Dict[int, int] = {}
-
-        for u in updates:
-            for cls, proto in u.class_prototypes.items():
-                n = u.class_counts.get(cls, 0)
-                if n == 0:
-                    continue
-                if cls not in accumulators:
-                    accumulators[cls] = torch.zeros_like(proto)
-                    counts[cls] = 0
-                accumulators[cls] += proto * n
-                counts[cls] += n
-
-        global_prototypes: Dict[int, torch.Tensor] = {}
-        for cls in accumulators:
-            global_prototypes[cls] = accumulators[cls] / counts[cls]
-
-        return global_prototypes
-
-    # ---- distillation with prototype regularisation -----------------------
-
-    def _distill_general_model(
-        self,
-        teacher_logits: torch.Tensor,
-        global_prototypes: Dict[int, torch.Tensor],
-    ) -> float:
-        """Distill the general model on public data.
-
-        Loss = ce_weight * CE(general, hard_label)
-             + (1 - ce_weight) * KL(general, aggregated_expert_logits)
-             + prototype_weight * cosine_distance(general_class_mean, prototype)
-
-        The CE term anchors the general model to ground-truth labels on the
-        public split, preventing it from drifting when expert logits are noisy.
-
-        When ``server_mixup_alpha > 0``, Mixup augmentation is applied to each
-        batch to reduce overfitting on the small public dataset.
-        """
-        temperature = self.config.federated.distill_temperature
-        prototype_weight: float = getattr(self.config.federated, "prototype_weight", 0.01)
-        server_ce_weight: float = getattr(self.config.federated, "server_ce_weight", 0.5)
-        mixup_alpha: float = getattr(self.config.federated, "server_mixup_alpha", 0.4)
-
-        optimizer = torch.optim.SGD(
-            self.general_model.parameters(),
-            lr=self.config.federated.distill_lr,
-            momentum=self.config.federated.local_momentum,
-            weight_decay=self.config.federated.local_weight_decay,
-        )
-
-        # Pre-compute prototype regularisation target tensor (num_classes, num_classes)
-        num_classes = self.config.model.num_classes
-        proto_target = torch.zeros(num_classes, num_classes, device=self.device)
-        proto_mask = torch.zeros(num_classes, device=self.device)
-        for cls, proto in global_prototypes.items():
-            proto_target[cls] = proto.to(self.device)
-            proto_mask[cls] = 1.0
-
-        losses: List[float] = []
-        teacher_cursor = 0
-
-        for _ in range(self.config.federated.distill_epochs):
-            self.general_model.train()
-            teacher_cursor = 0
-
-            for images, targets, _ in self.public_eval_loader:
-                batch_size = images.size(0)
-                batch_teacher = teacher_logits[teacher_cursor: teacher_cursor + batch_size].to(self.device)
-                teacher_cursor += batch_size
-                images = images.to(self.device)
-                targets = targets.to(self.device)
-
-                # ---- Mixup augmentation ----
-                # Blend pairs of samples to regularise against overfitting on
-                # the small public set.  Both images AND teacher logits are
-                # interpolated so the soft-label supervision stays consistent.
-                if mixup_alpha > 0 and batch_size > 1:
-                    lam = float(torch.distributions.Beta(mixup_alpha, mixup_alpha).sample())
-                    lam = max(lam, 1.0 - lam)  # ensure lam >= 0.5 so first sample dominates
-                    perm = torch.randperm(batch_size, device=self.device)
-                    images_mixed = lam * images + (1.0 - lam) * images[perm]
-                    batch_teacher_mixed = lam * batch_teacher + (1.0 - lam) * batch_teacher[perm]
-                    targets_a, targets_b = targets, targets[perm]
-                else:
-                    images_mixed = images
-                    batch_teacher_mixed = batch_teacher
-                    targets_a, targets_b = targets, targets
-                    lam = 1.0
-
-                optimizer.zero_grad(set_to_none=True)
-                student_logits = self.general_model(images_mixed)
-
-                # 1. Ground-truth CE loss (Mixup: interpolated cross-entropy)
-                ce_loss = lam * F.cross_entropy(student_logits, targets_a) + (1.0 - lam) * F.cross_entropy(student_logits, targets_b)
-
-                # 2. KL distillation loss from aggregated expert logits
-                kd_loss = F.kl_div(
-                    F.log_softmax(student_logits / temperature, dim=1),
-                    F.softmax(batch_teacher_mixed / temperature, dim=1),
-                    reduction="batchmean",
-                ) * (temperature ** 2)
-
-                # 3. Prototype regularisation (cosine similarity)
-                # Only computed on non-mixed targets_a (dominant in Mixup with lam>=0.5)
-                proto_loss = torch.tensor(0.0, device=self.device)
-                classes_in_batch = 0
-                if prototype_weight > 0 and proto_mask.sum() > 0:
-                    for cls in range(num_classes):
-                        if proto_mask[cls] == 0:
-                            continue
-                        cls_mask = targets_a == cls
-                        if not cls_mask.any():
-                            continue
-                        cls_mean_logit = student_logits[cls_mask].mean(dim=0)
-                        cos_sim = F.cosine_similarity(
-                            cls_mean_logit.unsqueeze(0),
-                            proto_target[cls].unsqueeze(0),
-                        )
-                        proto_loss = proto_loss + (1.0 - cos_sim.squeeze())
-                        classes_in_batch += 1
-
-                    if classes_in_batch > 0:
-                        proto_loss = proto_loss / classes_in_batch
-
-                # Combined loss: CE anchors to truth, KL absorbs expert dark knowledge
-                loss = (
-                    server_ce_weight * ce_loss
-                    + (1.0 - server_ce_weight) * kd_loss
-                    + prototype_weight * proto_loss
-                )
-                loss.backward()
-                optimizer.step()
-                losses.append(float(loss.detach().cpu().item()))
-
-        return sum(losses) / max(len(losses), 1)
-
-    # ---- predictors -------------------------------------------------------
+    # ---- predictors (use workbench for evaluation) ----
 
     def _predict_general_only(self, client_id, images, indices):
         self.general_model.eval()
@@ -563,10 +587,12 @@ class FedEGS3Server(BaseFederatedServer):
 
     def _predict_expert_only(self, client_id, images, indices):
         client = self.clients[client_id]
-        client.expert_model.eval()
-        logits = client.expert_model(images)
+        self.expert_workbench.load_state_dict(client.state_dict_cpu)
+        self.expert_workbench.eval()
+        logits = self.expert_workbench(images)
         return logits.argmax(dim=1), 0
 
     def _predict_routed(self, client_id, images, indices):
         client = self.clients[client_id]
-        return self._dual_threshold_route(client.expert_model, self.general_model, images)
+        self.expert_workbench.load_state_dict(client.state_dict_cpu)
+        return self._dual_threshold_route(self.expert_workbench, self.general_model, images)
