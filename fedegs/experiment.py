@@ -1,10 +1,24 @@
 import copy
-from typing import Dict, List, Tuple
+import logging
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 from fedegs.federated import create_federated_server
 
+LOGGER = logging.getLogger(__name__)
+
 
 def run_experiment_suite(config, data_bundle, data_module, writer=None) -> Tuple[List[object], Dict[str, object]]:
+    """Run the primary algorithm and all comparison algorithms.
+
+    Each algorithm gets its own ``SummaryWriter`` sub-directory so that
+    TensorBoard treats them as separate *runs* that can be overlaid in one
+    chart without overwriting each other's scalars.
+
+    The caller-provided *writer* is used for the primary algorithm.  For
+    every comparison algorithm a new writer is created under a sibling
+    directory (same parent, algorithm name appended).
+    """
     primary_history, primary_result = run_single_algorithm(
         algorithm_name=config.federated.server_algorithm,
         config=config,
@@ -19,15 +33,24 @@ def run_experiment_suite(config, data_bundle, data_module, writer=None) -> Tuple
         normalized = algorithm_name.lower()
         if normalized in seen:
             continue
+
+        # Create a dedicated writer for each comparison algorithm
+        comparison_writer = _make_comparison_writer(config, algorithm_name, writer)
+
         _, result = run_single_algorithm(
             algorithm_name=algorithm_name,
             config=config,
             data_bundle=data_bundle,
             data_module=data_module,
-            writer=writer,
+            writer=comparison_writer,
         )
         comparison_results[normalized] = result
         seen.add(normalized)
+
+        # Flush and close the per-algorithm writer
+        if comparison_writer is not None and comparison_writer is not writer:
+            comparison_writer.flush()
+            comparison_writer.close()
 
     suite = {
         "primary": primary_result,
@@ -65,22 +88,68 @@ def run_single_algorithm(algorithm_name: str, config, data_bundle, data_module, 
     if writer is not None:
         metrics = result.get("metrics", {})
         summary_step = 0
+        tag_prefix = f"summary_{algorithm_name}"
         if "routed_accuracy" in metrics:
-            writer.add_scalar("summary/routed_accuracy", metrics["routed_accuracy"], summary_step)
+            writer.add_scalar(f"{tag_prefix}/routed_accuracy", metrics["routed_accuracy"], summary_step)
         elif "accuracy" in metrics:
-            writer.add_scalar("summary/routed_accuracy", metrics["accuracy"], summary_step)
+            writer.add_scalar(f"{tag_prefix}/routed_accuracy", metrics["accuracy"], summary_step)
         if "routed_hard_accuracy" in metrics:
-            writer.add_scalar("summary/hard_accuracy", metrics["routed_hard_accuracy"], summary_step)
+            writer.add_scalar(f"{tag_prefix}/hard_accuracy", metrics["routed_hard_accuracy"], summary_step)
         elif "hard_accuracy" in metrics:
-            writer.add_scalar("summary/hard_accuracy", metrics["hard_accuracy"], summary_step)
+            writer.add_scalar(f"{tag_prefix}/hard_accuracy", metrics["hard_accuracy"], summary_step)
         if "general_invocation_rate" in metrics:
-            writer.add_scalar("summary/invocation_rate", metrics["general_invocation_rate"], summary_step)
+            writer.add_scalar(f"{tag_prefix}/invocation_rate", metrics["general_invocation_rate"], summary_step)
         elif "invocation_rate" in metrics:
-            writer.add_scalar("summary/invocation_rate", metrics["invocation_rate"], summary_step)
+            writer.add_scalar(f"{tag_prefix}/invocation_rate", metrics["invocation_rate"], summary_step)
         if "expert_only_accuracy" in metrics:
-            writer.add_scalar("summary/expert_accuracy", metrics["expert_only_accuracy"], summary_step)
+            writer.add_scalar(f"{tag_prefix}/expert_accuracy", metrics["expert_only_accuracy"], summary_step)
         if "general_only_accuracy" in metrics:
-            writer.add_scalar("summary/general_accuracy", metrics["general_only_accuracy"], summary_step)
+            writer.add_scalar(f"{tag_prefix}/general_accuracy", metrics["general_only_accuracy"], summary_step)
         if "final_training_loss" in metrics:
-            writer.add_scalar("summary/final_training_loss", metrics["final_training_loss"], summary_step)
+            writer.add_scalar(f"{tag_prefix}/final_training_loss", metrics["final_training_loss"], summary_step)
     return history, result
+
+
+def _make_comparison_writer(config, algorithm_name: str, primary_writer) -> Optional[object]:
+    """Create a SummaryWriter in a sibling directory for a comparison algorithm.
+
+    Directory layout (example)::
+
+        artifacts/tensorboard/fedegs3_cifar10_default/
+            fedegs3_cifar10_default_fedegs3_20260405_120000/   <- primary
+            fedegs3_cifar10_default_fedavg_20260405_120000/    <- comparison
+            fedegs3_cifar10_default_fedprox_20260405_120000/   <- comparison
+
+    TensorBoard ``--logdir artifacts/tensorboard/fedegs3_cifar10_default``
+    will discover all three as separate runs and overlay them in the same
+    charts automatically.
+    """
+    if primary_writer is None:
+        return None
+
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError:
+        return None
+
+    # Derive the comparison log directory from the primary writer's path
+    primary_dir = Path(primary_writer.log_dir)
+    parent_dir = primary_dir.parent
+
+    # Build a run name that replaces the algorithm portion
+    # Primary run_name pattern: {experiment}_{algorithm}_{timestamp}
+    # We swap the algorithm segment
+    primary_name = primary_dir.name
+    primary_algo = config.federated.server_algorithm
+
+    # Try to replace the algorithm name in the directory name
+    comparison_name = primary_name.replace(primary_algo, algorithm_name, 1)
+    if comparison_name == primary_name:
+        # Fallback: just append
+        comparison_name = f"{primary_name}_{algorithm_name}"
+
+    comparison_dir = parent_dir / comparison_name
+    LOGGER.info(
+        "Creating TensorBoard run for %s at %s", algorithm_name, comparison_dir,
+    )
+    return SummaryWriter(log_dir=str(comparison_dir))
