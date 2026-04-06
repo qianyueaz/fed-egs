@@ -26,7 +26,7 @@ federated:
     - fedavg
     - fedprox
   sequential_simulation: true
-  rounds: 500
+  rounds: 50
   clients_per_round: 10
   local_epochs: 5
   local_lr: 0.01
@@ -39,6 +39,7 @@ federated:
   distill_alpha: 0.5
   prototype_weight: 0.01
   server_ce_weight: 0.5
+  server_mixup_alpha: 0.4
   kd_warmup_rounds: 10
   device: cuda
   seed: 42
@@ -51,5 +52,5 @@ model:
 
 inference:
   routing_policy: dual_threshold_general_fallback
-  high_threshold: 0.8
+  high_threshold: 0.85
   low_threshold: 0.30

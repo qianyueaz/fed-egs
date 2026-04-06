@@ -49,6 +49,7 @@ class FederatedConfig:
     distill_alpha: float = 0.5
     prototype_weight: float = 0.1
     server_ce_weight: float = 0.5
+    server_mixup_alpha: float = 0.4
     kd_warmup_rounds: int = 10
     device: str = "cuda"
     seed: int = 42
@@ -149,6 +150,7 @@ def _resolve_override_target(config: ExperimentConfig, key: str):
         "distill_epochs": (config.federated, "distill_epochs"),
         "kd_warmup_rounds": (config.federated, "kd_warmup_rounds"),
         "server_ce_weight": (config.federated, "server_ce_weight"),
+        "server_mixup_alpha": (config.federated, "server_mixup_alpha"),
     }
     return mapping[key]
 

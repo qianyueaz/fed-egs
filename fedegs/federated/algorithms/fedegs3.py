@@ -452,10 +452,14 @@ class FedEGS3Server(BaseFederatedServer):
 
         The CE term anchors the general model to ground-truth labels on the
         public split, preventing it from drifting when expert logits are noisy.
+
+        When ``server_mixup_alpha > 0``, Mixup augmentation is applied to each
+        batch to reduce overfitting on the small public dataset.
         """
         temperature = self.config.federated.distill_temperature
         prototype_weight: float = getattr(self.config.federated, "prototype_weight", 0.01)
         server_ce_weight: float = getattr(self.config.federated, "server_ce_weight", 0.5)
+        mixup_alpha: float = getattr(self.config.federated, "server_mixup_alpha", 0.4)
 
         optimizer = torch.optim.SGD(
             self.general_model.parameters(),
@@ -486,27 +490,45 @@ class FedEGS3Server(BaseFederatedServer):
                 images = images.to(self.device)
                 targets = targets.to(self.device)
 
+                # ---- Mixup augmentation ----
+                # Blend pairs of samples to regularise against overfitting on
+                # the small public set.  Both images AND teacher logits are
+                # interpolated so the soft-label supervision stays consistent.
+                if mixup_alpha > 0 and batch_size > 1:
+                    lam = float(torch.distributions.Beta(mixup_alpha, mixup_alpha).sample())
+                    lam = max(lam, 1.0 - lam)  # ensure lam >= 0.5 so first sample dominates
+                    perm = torch.randperm(batch_size, device=self.device)
+                    images_mixed = lam * images + (1.0 - lam) * images[perm]
+                    batch_teacher_mixed = lam * batch_teacher + (1.0 - lam) * batch_teacher[perm]
+                    targets_a, targets_b = targets, targets[perm]
+                else:
+                    images_mixed = images
+                    batch_teacher_mixed = batch_teacher
+                    targets_a, targets_b = targets, targets
+                    lam = 1.0
+
                 optimizer.zero_grad(set_to_none=True)
-                student_logits = self.general_model(images)
+                student_logits = self.general_model(images_mixed)
 
-                # 1. Ground-truth CE loss on public data (hard labels)
-                ce_loss = F.cross_entropy(student_logits, targets)
+                # 1. Ground-truth CE loss (Mixup: interpolated cross-entropy)
+                ce_loss = lam * F.cross_entropy(student_logits, targets_a) + (1.0 - lam) * F.cross_entropy(student_logits, targets_b)
 
-                # 2. KL distillation loss from aggregated expert logits (soft labels)
+                # 2. KL distillation loss from aggregated expert logits
                 kd_loss = F.kl_div(
                     F.log_softmax(student_logits / temperature, dim=1),
-                    F.softmax(batch_teacher / temperature, dim=1),
+                    F.softmax(batch_teacher_mixed / temperature, dim=1),
                     reduction="batchmean",
                 ) * (temperature ** 2)
 
                 # 3. Prototype regularisation (cosine similarity)
+                # Only computed on non-mixed targets_a (dominant in Mixup with lam>=0.5)
                 proto_loss = torch.tensor(0.0, device=self.device)
                 classes_in_batch = 0
                 if prototype_weight > 0 and proto_mask.sum() > 0:
                     for cls in range(num_classes):
                         if proto_mask[cls] == 0:
                             continue
-                        cls_mask = targets == cls
+                        cls_mask = targets_a == cls
                         if not cls_mask.any():
                             continue
                         cls_mean_logit = student_logits[cls_mask].mean(dim=0)

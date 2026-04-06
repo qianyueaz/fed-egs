@@ -145,10 +145,13 @@ class BaseFederatedServer:
             expert_mid_logits = expert_logits[mid_mask]
             mid_confidence = expert_confidence[mid_mask]
 
+            # Fuse in probability space to avoid logit-scale mismatch.
             # Confidence closer to the high threshold trusts the expert more.
             expert_weight = ((mid_confidence - low_threshold) / (high_threshold - low_threshold)).clamp(0.0, 1.0)
-            fused_logits = expert_weight.unsqueeze(1) * expert_mid_logits + (1.0 - expert_weight.unsqueeze(1)) * mid_general_logits
-            predictions[mid_mask] = torch.argmax(fused_logits, dim=1)
+            expert_mid_probs = torch.softmax(expert_mid_logits, dim=1)
+            general_mid_probs = torch.softmax(mid_general_logits, dim=1)
+            fused_probs = expert_weight.unsqueeze(1) * expert_mid_probs + (1.0 - expert_weight.unsqueeze(1)) * general_mid_probs
+            predictions[mid_mask] = torch.argmax(fused_probs, dim=1)
             invoked_general += int(mid_mask.sum().item())
             for sample_idx in mid_mask.nonzero(as_tuple=False).flatten().tolist():
                 route_types[sample_idx] = "fusion"
