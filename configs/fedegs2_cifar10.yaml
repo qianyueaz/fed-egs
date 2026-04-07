@@ -13,26 +13,60 @@ dataset:
   complex_easy_ratio: 0.30
   batch_size: 128
   num_workers: 8
-  difficulty_checkpoint:
+  difficulty_checkpoint: ./artifacts/checkpoints/cifar10_resnet18_teacher.pt
   partition_cache_name: client_partitions.json
-  public_dataset_size: 2000
-  public_split_strategy: random
+  public_dataset_size: 0
+  public_split_strategy: per_class_ratio
+  public_per_class_ratio: 0.05
 
 federated:
   server_algorithm: fedegs2
   client_algorithm: sgd_expert_local
-  compare_algorithms: []
+  compare_algorithms:
+    - fedavg
+    - fedprox
+    - ideal
   sequential_simulation: true
-  rounds: 50
+  rounds: 180
   clients_per_round: 10
-  local_epochs: 5
+  local_epochs: 7
   local_lr: 0.01
   local_momentum: 0.9
   local_weight_decay: 0.0005
   prox_mu: 0.001
-  distill_epochs: 2
-  distill_lr: 0.01
+  distill_epochs: 1
+  distill_lr: 0.001
   distill_temperature: 2.0
+  client_kd_weight: 1.0
+  client_kd_temperature: 3.0
+  client_feature_hint_weight: 0.4
+  client_hard_weight: 1.2
+  client_hard_focus_power: 1.6
+  client_hard_margin_threshold: 0.20
+  client_hard_extra_weight: 0.8
+  hard_subset_ratio: 0.25
+  hard_subset_kd_boost: 0.5
+  hard_subset_hint_boost: 0.5
+  expert_refresh_epochs: 1
+  expert_refresh_lr_scale: 0.5
+  freeze_expert_refresh_epochs: 2
+  freeze_client_kd_weight: 1.3
+  freeze_client_feature_hint_weight: 0.6
+  freeze_local_lr_scale: 0.7
+  feature_align_weight: 1.0
+  logit_align_weight: 1.0
+  relation_align_weight: 0.05
+  feature_noise_std: 0.01
+  min_uncertainty_weight: 0.2
+  min_client_reliability: 0.05
+  prototype_momentum: 0.7
+  general_anchor_weight: 0.0
+  general_warmup_rounds: 20
+  general_distill_ramp_rounds: 20
+  general_distill_max_scale: 0.15
+  general_freeze_patience: 15
+  general_init_from_teacher: false
+  restore_best_checkpoint: true
   device: cuda
   seed: 42
 
@@ -42,11 +76,31 @@ model:
   general_width: 1.0
   expert_width: 0.25
   expert_base_channels: 32
+  knowledge_dim: 512
   baseline_architecture: width_scalable_resnet18
-  baseline_width: 1.0
+  baseline_width: 0.25
   baseline_base_channels: 32
 
 inference:
-  routing_policy: dual_threshold_general_fallback
-  high_threshold: 0.85
-  low_threshold: 0.30
+  routing_policy: confidence_general_fallback
+  confidence_threshold: 0.18
+  high_threshold: 0.18
+  low_threshold: 0.18
+  route_distance_threshold: 0.01
+  min_confidence_threshold: 0.05
+  max_confidence_threshold: 0.30
+  min_margin_threshold: 0.00
+  max_margin_threshold: 0.04
+  personalized_threshold_step: 0.01
+  personalized_margin_step: 0.005
+  expert_priority_reliability_floor: 0.32
+  expert_priority_reliability_target: 0.55
+  target_general_invocation_rate: 0.20
+  simple_client_fallback_floor: 0.03
+  complex_client_fallback_floor: 0.10
+  public_teacher_gap_guard: 0.03
+  route_hard_confidence_delta: 0.03
+  route_hard_margin_delta: 0.02
+  route_warmup_rounds: 0
+  route_warmup_confidence_threshold: 0.40
+  route_disable_distance_during_warmup: true

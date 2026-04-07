@@ -1,4 +1,4 @@
-experiment_name: compare_fedegs_v1_cifar10
+experiment_name: baseline_c_ideal_upper_bound
 output_dir: ./artifacts
 
 dataset:
@@ -12,27 +12,30 @@ dataset:
   simple_easy_ratio: 0.90
   complex_easy_ratio: 0.30
   batch_size: 128
-  num_workers: 0
+  num_workers: 4
   difficulty_checkpoint: ./artifacts/checkpoints/cifar10_resnet18_teacher.pt
   partition_cache_name: client_partitions.json
   public_dataset_size: 0
   public_split_strategy: random
 
 federated:
-  server_algorithm: fedprox
+  server_algorithm: ideal
   client_algorithm: sgd_expert_local
   compare_algorithms: []
   sequential_simulation: true
-  rounds: 50
+  rounds: 100
   clients_per_round: 10
   local_epochs: 5
   local_lr: 0.01
   local_momentum: 0.9
   local_weight_decay: 0.0005
   prox_mu: 0.001
-  distill_epochs: 2
+  distill_epochs: 1
   distill_lr: 0.01
   distill_temperature: 2.0
+  feature_align_weight: 1.0
+  logit_align_weight: 1.0
+  feature_noise_std: 0.0
   device: cuda
   seed: 42
 
@@ -43,7 +46,7 @@ model:
   expert_width: 0.25
   expert_base_channels: 32
   baseline_architecture: width_scalable_resnet18
-  baseline_width: 0.25
+  baseline_width: 1.0
   baseline_base_channels: 32
 
 inference:

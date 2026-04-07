@@ -1,14 +1,16 @@
 import json
 import logging
 import random
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
-from torchvision import datasets, models, transforms
+from torchvision import datasets, transforms
 
 from fedegs.config import DatasetConfig
+from fedegs.models import build_teacher_model, load_teacher_checkpoint
 
 
 LOGGER = logging.getLogger(__name__)
@@ -26,7 +28,8 @@ class IndexedDataset(Dataset):
         return len(self.dataset)
 
 
-PARTITION_CACHE_VERSION = 2
+PARTITION_CACHE_VERSION = 5
+PUBLIC_CACHE_VERSION = 2
 
 
 class CIFAR10FederatedDataModule:
@@ -49,13 +52,7 @@ class CIFAR10FederatedDataModule:
                 transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
             ]
         )
-        self.scoring_transform = transforms.Compose(
-            [
-                transforms.Resize(224),
-                transforms.ToTensor(),
-                transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-            ]
-        )
+        self.scoring_transform = self.eval_transform
 
     def prepare(self) -> None:
         datasets.CIFAR10(root=self.config.root, train=True, download=True)
@@ -64,42 +61,42 @@ class CIFAR10FederatedDataModule:
     def build(self) -> Dict[str, object]:
         self.prepare()
         train_raw = datasets.CIFAR10(root=self.config.root, train=True, transform=self.train_transform, download=False)
-        train_public_raw = datasets.CIFAR10(root=self.config.root, train=True, transform=self.eval_transform, download=False)
         train_scoring = datasets.CIFAR10(root=self.config.root, train=True, transform=self.scoring_transform, download=False)
         test_raw = datasets.CIFAR10(root=self.config.root, train=False, transform=self.eval_transform, download=False)
         test_scoring = datasets.CIFAR10(root=self.config.root, train=False, transform=self.scoring_transform, download=False)
+        public_raw = datasets.CIFAR10(root=self.config.root, train=True, transform=self.eval_transform, download=False)
+
+        public_indices = self._load_or_build_public_indices(total_samples=len(train_raw), labels=public_raw.targets)
+        public_index_set = set(public_indices)
 
         train_hard_indices, train_easy_indices = self._load_or_build_difficulty_split(train_scoring, split_name="train")
         test_hard_indices, test_easy_indices = self._load_or_build_difficulty_split(test_scoring, split_name="test")
+        if public_index_set:
+            train_hard_indices = [idx for idx in train_hard_indices if idx not in public_index_set]
+            train_easy_indices = [idx for idx in train_easy_indices if idx not in public_index_set]
 
-        public_indices = self._load_or_build_public_indices(len(train_raw))
-        public_index_set = set(public_indices)
-        private_train_hard = [idx for idx in train_hard_indices if idx not in public_index_set]
-        private_train_easy = [idx for idx in train_easy_indices if idx not in public_index_set]
-
-        client_train_indices = self._load_or_build_client_partitions(private_train_hard, private_train_easy, split_name="train")
+        client_train_indices = self._load_or_build_client_partitions(train_hard_indices, train_easy_indices, split_name="train")
         client_test_indices = self._load_or_build_client_partitions(test_hard_indices, test_easy_indices, split_name="test")
-        self._log_partition_summary(client_train_indices, private_train_hard, split_name="train")
+        self._log_partition_summary(client_train_indices, train_hard_indices, split_name="train")
         self._log_partition_summary(client_test_indices, test_hard_indices, split_name="test")
-        LOGGER.info("public distillation set | samples=%d | cache=%s", len(public_indices), self._public_cache_path())
 
         indexed_train = IndexedDataset(train_raw)
         indexed_test = IndexedDataset(test_raw)
-        indexed_public = IndexedDataset(train_public_raw)
+        indexed_public = IndexedDataset(public_raw)
 
         return {
             "client_datasets": {client_id: Subset(indexed_train, indices) for client_id, indices in client_train_indices.items()},
             "client_test_datasets": {client_id: Subset(indexed_test, indices) for client_id, indices in client_test_indices.items()},
             "client_indices": client_train_indices,
             "client_test_indices": client_test_indices,
-            "public_dataset": Subset(indexed_public, public_indices),
-            "public_indices": public_indices,
             "train_dataset": indexed_train,
             "test_dataset": indexed_test,
             "train_hard_indices": set(train_hard_indices),
             "train_easy_indices": set(train_easy_indices),
             "test_hard_indices": set(test_hard_indices),
             "test_easy_indices": set(test_easy_indices),
+            "public_dataset": Subset(indexed_public, public_indices) if public_indices else None,
+            "public_indices": public_indices,
         }
 
     def _difficulty_cache_path(self, split_name: str) -> Path:
@@ -110,6 +107,84 @@ class CIFAR10FederatedDataModule:
 
     def _public_cache_path(self) -> Path:
         return Path(self.config.cache_dir) / "public_data_indices.json"
+
+    def _load_or_build_public_indices(self, total_samples: int, labels: Sequence[int]) -> List[int]:
+        strategy = self.config.public_split_strategy
+        configured_public_size = max(int(self.config.public_dataset_size), 0)
+        per_class_ratio = max(float(self.config.public_per_class_ratio), 0.0)
+        if strategy == "random" and configured_public_size == 0:
+            return []
+        if strategy == "per_class_ratio" and per_class_ratio == 0.0:
+            return []
+
+        cache_path = self._public_cache_path()
+        if cache_path.exists():
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            metadata = payload.get("metadata", {})
+            expected = {
+                "seed": self.seed,
+                "configured_public_dataset_size": configured_public_size,
+                "public_split_strategy": strategy,
+                "public_per_class_ratio": per_class_ratio,
+                "public_cache_version": PUBLIC_CACHE_VERSION,
+            }
+            if all(metadata.get(key) == value for key, value in expected.items()):
+                LOGGER.info("Loaded cached public train split from %s", cache_path)
+                return list(payload.get("indices", []))
+
+        rng = random.Random(self.seed)
+        if strategy == "random":
+            if configured_public_size >= total_samples:
+                raise ValueError(
+                    f"public_dataset_size={configured_public_size} must be smaller than the train split size {total_samples}."
+                )
+            indices = list(range(total_samples))
+            rng.shuffle(indices)
+            public_indices = sorted(indices[:configured_public_size])
+        elif strategy == "per_class_ratio":
+            if not 0.0 < per_class_ratio < 1.0:
+                raise ValueError(
+                    f"public_per_class_ratio must be in (0, 1) for per_class_ratio strategy, got {per_class_ratio}."
+                )
+            class_to_indices: Dict[int, List[int]] = defaultdict(list)
+            for sample_index, label in enumerate(labels):
+                class_to_indices[int(label)].append(sample_index)
+
+            public_indices = []
+            for label, class_indices in sorted(class_to_indices.items()):
+                class_sample_count = int(round(len(class_indices) * per_class_ratio))
+                if class_sample_count <= 0:
+                    raise ValueError(
+                        f"public_per_class_ratio={per_class_ratio} produced zero public samples for class {label}."
+                    )
+                shuffled = list(class_indices)
+                rng.shuffle(shuffled)
+                public_indices.extend(shuffled[:class_sample_count])
+            public_indices.sort()
+        else:
+            raise ValueError(f"Unsupported public split strategy: {strategy}")
+        realized_public_size = len(public_indices)
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            json.dumps(
+                {
+                    "metadata": {
+                        "seed": self.seed,
+                        "configured_public_dataset_size": configured_public_size,
+                        "realized_public_dataset_size": realized_public_size,
+                        "public_split_strategy": strategy,
+                        "public_per_class_ratio": per_class_ratio,
+                        "public_cache_version": PUBLIC_CACHE_VERSION,
+                    },
+                    "indices": public_indices,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        LOGGER.info("Saved public train split cache to %s", cache_path)
+        return public_indices
 
     def _load_or_build_difficulty_split(self, scoring_dataset: Dataset, split_name: str) -> Tuple[List[int], List[int]]:
         cache_path = self._difficulty_cache_path(split_name)
@@ -132,45 +207,6 @@ class CIFAR10FederatedDataModule:
         )
         LOGGER.info("Saved %s difficulty split cache to %s", split_name, cache_path)
         return hard_indices, easy_indices
-
-    def _load_or_build_public_indices(self, total_samples: int) -> List[int]:
-        requested = max(0, min(self.config.public_dataset_size, total_samples))
-        if requested == 0:
-            return []
-
-        cache_path = self._public_cache_path()
-        if cache_path.exists():
-            payload = json.loads(cache_path.read_text(encoding="utf-8"))
-            metadata = payload.get("metadata", {})
-            if metadata.get("seed") == self.seed and metadata.get("public_dataset_size") == requested and metadata.get("public_split_strategy") == self.config.public_split_strategy:
-                LOGGER.info("Loaded cached public distillation indices from %s", cache_path)
-                return list(payload["indices"])
-
-        rng = random.Random(self.seed + 17)
-        indices = list(range(total_samples))
-        if self.config.public_split_strategy == "random":
-            rng.shuffle(indices)
-            public_indices = sorted(indices[:requested])
-        else:
-            raise ValueError(f"Unsupported public split strategy: {self.config.public_split_strategy}")
-
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(
-            json.dumps(
-                {
-                    "metadata": {
-                        "seed": self.seed,
-                        "public_dataset_size": requested,
-                        "public_split_strategy": self.config.public_split_strategy,
-                    },
-                    "indices": public_indices,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        LOGGER.info("Saved public distillation indices to %s", cache_path)
-        return public_indices
 
     def _load_or_build_client_partitions(
         self,
@@ -197,7 +233,9 @@ class CIFAR10FederatedDataModule:
                 "simple_easy_ratio": self.config.simple_easy_ratio,
                 "complex_easy_ratio": self.config.complex_easy_ratio,
                 "hard_ratio": self.config.hard_ratio,
-                "public_dataset_size": self.config.public_dataset_size if split_name == "train" else 0,
+                "public_dataset_size": self.config.public_dataset_size,
+                "public_split_strategy": self.config.public_split_strategy,
+                "public_per_class_ratio": self.config.public_per_class_ratio,
                 "partition_cache_version": PARTITION_CACHE_VERSION,
             },
             "partitions": partitions,
@@ -216,7 +254,9 @@ class CIFAR10FederatedDataModule:
             "simple_easy_ratio": self.config.simple_easy_ratio,
             "complex_easy_ratio": self.config.complex_easy_ratio,
             "hard_ratio": self.config.hard_ratio,
-            "public_dataset_size": self.config.public_dataset_size if split_name == "train" else 0,
+            "public_dataset_size": self.config.public_dataset_size,
+            "public_split_strategy": self.config.public_split_strategy,
+            "public_per_class_ratio": self.config.public_per_class_ratio,
             "partition_cache_version": PARTITION_CACHE_VERSION,
         }
         return all(metadata.get(key) == value for key, value in expected.items())
@@ -245,27 +285,20 @@ class CIFAR10FederatedDataModule:
         return losses
 
     def _build_difficulty_model(self) -> torch.nn.Module:
-        if self.config.difficulty_checkpoint:
-            model = models.resnet18(weights=None)
-            model.fc = torch.nn.Linear(model.fc.in_features, 10)
-            state = torch.load(self.config.difficulty_checkpoint, map_location="cpu")
-            model.load_state_dict(state)
-            return model
-
-        try:
-            weights = models.ResNet18_Weights.IMAGENET1K_V1
-            model = models.resnet18(weights=weights)
-            model.fc = torch.nn.Linear(model.fc.in_features, 10)
-            LOGGER.warning(
-                "No CIFAR-10 teacher checkpoint was provided; using ImageNet-pretrained ResNet18 "
-                "for approximate hardness ranking."
+        if not self.config.difficulty_checkpoint:
+            raise ValueError(
+                "A CIFAR-10 teacher checkpoint is required for difficulty-aware partitioning. "
+                "Run pretrain.py first and set dataset.difficulty_checkpoint."
             )
-            return model
-        except Exception as exc:
-            LOGGER.warning("Falling back to randomly initialized ResNet18 for difficulty scoring: %s", exc)
-            model = models.resnet18(weights=None)
-            model.fc = torch.nn.Linear(model.fc.in_features, 10)
-            return model
+
+        checkpoint_path = Path(self.config.difficulty_checkpoint)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Difficulty checkpoint not found: {checkpoint_path}")
+
+        model = build_teacher_model(num_classes=10)
+        state = torch.load(checkpoint_path, map_location="cpu")
+        load_teacher_checkpoint(model, state)
+        return model
 
     def _build_client_partitions(self, hard_indices: Sequence[int], easy_indices: Sequence[int]) -> Dict[str, List[int]]:
         rng = random.Random(self.seed)

@@ -28,6 +28,7 @@ class DatasetConfig:
     partition_cache_name: str = "client_partitions.json"
     public_dataset_size: int = 1000
     public_split_strategy: str = "random"
+    public_per_class_ratio: float = 0.0
 
 
 @dataclass
@@ -46,11 +47,36 @@ class FederatedConfig:
     distill_epochs: int = 1
     distill_lr: float = 0.001
     distill_temperature: float = 2.0
-    distill_alpha: float = 0.5
-    prototype_weight: float = 0.1
-    server_ce_weight: float = 0.5
-    server_mixup_alpha: float = 0.4
-    kd_warmup_rounds: int = 10
+    client_kd_weight: float = 0.5
+    client_kd_temperature: float = 3.0
+    client_feature_hint_weight: float = 0.3
+    client_hard_weight: float = 1.0
+    client_hard_focus_power: float = 1.5
+    client_hard_margin_threshold: float = 0.20
+    client_hard_extra_weight: float = 0.6
+    hard_subset_ratio: float = 0.25
+    hard_subset_kd_boost: float = 0.5
+    hard_subset_hint_boost: float = 0.5
+    expert_refresh_epochs: int = 1
+    expert_refresh_lr_scale: float = 0.5
+    freeze_expert_refresh_epochs: int = 2
+    freeze_client_kd_weight: float = 1.3
+    freeze_client_feature_hint_weight: float = 0.6
+    freeze_local_lr_scale: float = 0.7
+    feature_align_weight: float = 1.0
+    logit_align_weight: float = 1.0
+    relation_align_weight: float = 0.0
+    feature_noise_std: float = 0.01
+    min_uncertainty_weight: float = 0.2
+    min_client_reliability: float = 0.05
+    prototype_momentum: float = 0.7
+    general_anchor_weight: float = 0.7
+    general_warmup_rounds: int = 20
+    general_distill_ramp_rounds: int = 20
+    general_distill_max_scale: float = 0.25
+    general_freeze_patience: int = 15
+    general_init_from_teacher: bool = False
+    restore_best_checkpoint: bool = True
     device: str = "cuda"
     seed: int = 42
 
@@ -62,6 +88,7 @@ class ModelConfig:
     general_width: float = 1.0
     expert_width: float = 0.25
     expert_base_channels: int = 32
+    knowledge_dim: int = 512
     baseline_architecture: str = "width_scalable_resnet18"
     baseline_width: Optional[float] = None
     baseline_base_channels: int = 32
@@ -70,8 +97,29 @@ class ModelConfig:
 @dataclass
 class InferenceConfig:
     routing_policy: str = "dual_threshold_general_fallback"
+    confidence_threshold: float = 0.18
     high_threshold: float = 0.85
     low_threshold: float = 0.60
+    route_distance_threshold: float = 0.01
+    min_confidence_threshold: float = 0.05
+    max_confidence_threshold: float = 0.30
+    min_margin_threshold: float = 0.00
+    max_margin_threshold: float = 0.04
+    personalized_threshold_step: float = 0.01
+    personalized_margin_step: float = 0.005
+    expert_priority_accuracy_floor: float = 0.55
+    expert_priority_accuracy_target: float = 0.70
+    expert_priority_reliability_floor: float = 0.35
+    expert_priority_reliability_target: float = 0.55
+    target_general_invocation_rate: float = 0.20
+    simple_client_fallback_floor: float = 0.02
+    complex_client_fallback_floor: float = 0.08
+    public_teacher_gap_guard: float = 0.03
+    route_hard_confidence_delta: float = 0.03
+    route_hard_margin_delta: float = 0.02
+    route_warmup_rounds: int = 0
+    route_warmup_confidence_threshold: float = 0.40
+    route_disable_distance_during_warmup: bool = True
 
 
 @dataclass
@@ -136,21 +184,14 @@ def _resolve_override_target(config: ExperimentConfig, key: str):
         "batch_size": (config.dataset, "batch_size"),
         "device": (config.federated, "device"),
         "difficulty_checkpoint": (config.dataset, "difficulty_checkpoint"),
+        "routing_threshold": (config.inference, "confidence_threshold"),
         "high_threshold": (config.inference, "high_threshold"),
         "low_threshold": (config.inference, "low_threshold"),
+        "route_distance_threshold": (config.inference, "route_distance_threshold"),
         "num_workers": (config.dataset, "num_workers"),
         "output_dir": (config, "output_dir"),
         "experiment_name": (config, "experiment_name"),
         "prox_mu": (config.federated, "prox_mu"),
-        "server_algorithm": (config.federated, "server_algorithm"),
-        "distill_alpha": (config.federated, "distill_alpha"),
-        "prototype_weight": (config.federated, "prototype_weight"),
-        "distill_temperature": (config.federated, "distill_temperature"),
-        "distill_lr": (config.federated, "distill_lr"),
-        "distill_epochs": (config.federated, "distill_epochs"),
-        "kd_warmup_rounds": (config.federated, "kd_warmup_rounds"),
-        "server_ce_weight": (config.federated, "server_ce_weight"),
-        "server_mixup_alpha": (config.federated, "server_mixup_alpha"),
     }
     return mapping[key]
 

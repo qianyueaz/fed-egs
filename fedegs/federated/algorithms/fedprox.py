@@ -5,7 +5,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from fedegs.federated.common import BaseFederatedClient, BaseFederatedServer, ClientUpdate, RoundMetrics, LOGGER
-from fedegs.models import average_weighted_deltas, build_baseline_model, model_memory_mb
+from fedegs.models import SmallCNN, average_weighted_deltas, build_model, estimate_model_flops, model_memory_mb
 from fedegs.models.width_scalable_resnet import state_dict_delta
 
 
@@ -40,7 +40,19 @@ class FedProxClient(BaseFederatedClient):
 class FedProxServer(BaseFederatedServer):
     def __init__(self, config, client_datasets: Dict[str, Dataset], client_test_datasets: Dict[str, Dataset], data_module, test_hard_indices, writer=None) -> None:
         super().__init__(config, client_datasets, client_test_datasets, data_module, test_hard_indices, writer)
-        self.global_model = build_baseline_model(config).to(self.device)
+        self.global_model = SmallCNN(
+            num_classes=config.model.num_classes,
+            base_channels=config.model.expert_base_channels,
+            knowledge_dim=config.model.knowledge_dim,
+        ).to(self.device)
+        reference_general_model = build_model(
+            architecture=config.model.architecture,
+            num_classes=config.model.num_classes,
+            width_factor=config.model.general_width,
+            base_channels=config.model.expert_base_channels,
+        ).to(self.device)
+        self.model_flops = estimate_model_flops(self.global_model)
+        self.general_flops = estimate_model_flops(reference_general_model)
         self.clients = {
             client_id: FedProxClient(client_id, dataset, config.federated.device, config)
             for client_id, dataset in client_datasets.items()
@@ -66,8 +78,31 @@ class FedProxServer(BaseFederatedServer):
             personalized_eval = self._evaluate_predictor_on_client_tests(self._predict_with_global_model, prefix="fedprox")
             avg_loss = sum(update.loss for update in updates) / max(len(updates), 1)
             aggregate = personalized_eval["aggregate"]
-            round_metrics = RoundMetrics(round_idx, avg_loss, aggregate["accuracy"], aggregate["hard_accuracy"], aggregate["invocation_rate"])
-            LOGGER.info("fedprox round %d | loss=%.4f | acc=%.4f | hard_acc=%.4f", round_idx, avg_loss, aggregate["accuracy"], aggregate["hard_accuracy"])
+            macro = personalized_eval["macro"]
+            compute_profile = self._build_compute_profile(
+                self.model_flops,
+                self.general_flops,
+                aggregate["invocation_rate"],
+                mode="expert_only" if self.model_flops < self.general_flops else "general_only",
+            )
+            round_metrics = RoundMetrics(
+                round_idx,
+                avg_loss,
+                aggregate["accuracy"],
+                aggregate["hard_recall"],
+                aggregate["invocation_rate"],
+                local_accuracy=macro["accuracy"],
+                compute_savings=compute_profile["savings_ratio"],
+            )
+            LOGGER.info(
+                "fedprox round %d | loss=%.4f | global_acc=%.4f | local_acc=%.4f | hard_recall=%.4f | savings=%.4f",
+                round_idx,
+                avg_loss,
+                aggregate["accuracy"],
+                macro["accuracy"],
+                aggregate["hard_recall"],
+                compute_profile["savings_ratio"],
+            )
             self._log_round_metrics("fedprox", round_metrics)
             metrics.append(round_metrics)
         self.last_history = metrics
@@ -76,17 +111,41 @@ class FedProxServer(BaseFederatedServer):
     def evaluate_baselines(self, test_dataset: Dataset):
         personalized_eval = self._evaluate_predictor_on_client_tests(self._predict_with_global_model, prefix="fedprox_final")
         aggregate = personalized_eval["aggregate"]
+        macro = personalized_eval["macro"]
         final_loss = self.last_history[-1].avg_client_loss if self.last_history else 0.0
+        compute_profile = self._build_compute_profile(
+            self.model_flops,
+            self.general_flops,
+            aggregate["invocation_rate"],
+            mode="expert_only" if self.model_flops < self.general_flops else "general_only",
+        )
         return {
             "algorithm": "fedprox",
             "metrics": {
                 **aggregate,
+                "global_accuracy": aggregate["accuracy"],
+                "local_accuracy": macro["accuracy"],
+                "hard_sample_recall": aggregate["hard_recall"],
+                "routed_accuracy": aggregate["accuracy"],
+                "routed_hard_accuracy": aggregate["hard_recall"],
+                "compute_savings": compute_profile["savings_ratio"],
                 "final_training_loss": final_loss,
             },
             "client_metrics": personalized_eval["clients"],
+            "group_metrics": personalized_eval["groups"],
+            "compute": {
+                "model": compute_profile,
+            },
             "memory_mb": {
                 "expert": model_memory_mb(self.global_model),
-                "general": model_memory_mb(self.global_model),
+                "general": model_memory_mb(
+                    build_model(
+                        architecture=self.config.model.architecture,
+                        num_classes=self.config.model.num_classes,
+                        width_factor=self.config.model.general_width,
+                        base_channels=self.config.model.expert_base_channels,
+                    )
+                ),
             },
         }
 

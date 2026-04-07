@@ -16,6 +16,8 @@ def save_metrics(output_dir: str, history: List[RoundMetrics], results: Dict[str
             "routed_accuracy": item.routed_accuracy,
             "hard_accuracy": item.hard_accuracy,
             "invocation_rate": item.invocation_rate,
+            "local_accuracy": item.local_accuracy,
+            "compute_savings": item.compute_savings,
         }
         for item in history
     ]
@@ -36,33 +38,3 @@ def format_memory_table(memory_metrics: Dict[str, float]) -> str:
         f"| General (1.0x) | {general:.2f} |\n"
         f"| Ratio (General / Expert) | {ratio:.2f}x |\n"
     )
-
-
-def format_compute_savings(metrics: Dict[str, object]) -> str:
-    """Format a short summary of compute savings from the routing mechanism.
-
-    The invocation rate tells us what fraction of samples needed the general
-    model.  A lower rate means the expert handled more samples on its own,
-    saving the cost of running the larger general model.
-    """
-    invocation_rate = metrics.get("general_invocation_rate", metrics.get("invocation_rate"))
-    if invocation_rate is None:
-        return "Compute savings: N/A (no invocation rate recorded)\n"
-
-    expert_only_pct = (1.0 - invocation_rate) * 100
-    general_pct = invocation_rate * 100
-
-    lines = [
-        "| Metric | Value |",
-        "| --- | ---: |",
-        f"| Samples handled by expert only | {expert_only_pct:.1f}% |",
-        f"| Samples requiring general model | {general_pct:.1f}% |",
-    ]
-
-    routed_acc = metrics.get("routed_accuracy")
-    expert_acc = metrics.get("expert_only_accuracy")
-    if routed_acc is not None and expert_acc is not None:
-        improvement = (routed_acc - expert_acc) * 100
-        lines.append(f"| Accuracy gain from routing | {improvement:+.2f}% |")
-
-    return "\n".join(lines) + "\n"

@@ -70,18 +70,3 @@ This means:
 5. Inference still uses the original confidence routing: local expert first, then fallback to the general model for low-confidence samples.
 
 This keeps client-side training lightweight while giving the general model a denser, more stable supervision signal than sparse block updates.
-
-
-## FedEGS-3 Flow
-
-`FedEGS-3` adds mutual knowledge distillation on top of FedEGS-2:
-
-1. The server sends the current general model to sampled clients.
-2. Each client uses the general model as a **teacher** (forward-only, no backprop) to produce soft labels on its private local data.
-3. The client trains its small expert with a combined loss: `(1-α)·CE(expert, hard_label) + α·KL(expert, teacher_soft_label)`.
-4. The client computes **class-wise logit prototypes** (per-class average logits over local data) and uploads them alongside public-set logits.
-5. The server aggregates public logits (weighted average) and class prototypes (weighted average).
-6. The server distills the general model on the public split with an additional **prototype regularisation** term: `MSE(general_class_mean_logit, aggregated_prototype)`.
-7. Inference uses the same dual-threshold routing as FedEGS-2.
-
-This creates a bidirectional knowledge loop: general → expert (via soft labels) and expert → general (via logits + prototypes).

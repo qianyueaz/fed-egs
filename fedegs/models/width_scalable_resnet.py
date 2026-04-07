@@ -54,6 +54,7 @@ class WidthScalableResNet(nn.Module):
         self.layer4 = self._make_layer(widths[3], blocks=2, stride=2)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(widths[3], num_classes)
+        self.feature_dim = widths[3]
 
     def _make_layer(self, planes: int, blocks: int, stride: int) -> nn.Sequential:
         strides = [stride] + [1] * (blocks - 1)
@@ -63,15 +64,24 @@ class WidthScalableResNet(nn.Module):
             self.in_planes = planes * BasicBlock.expansion
         return nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         x = F.relu(self.bn1(self.conv1(x)), inplace=True)
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
         x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        return self.fc(x)
+        return torch.flatten(x, 1)
+
+    def classify_features(self, features: torch.Tensor) -> torch.Tensor:
+        return self.fc(features)
+
+    def forward_with_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        features = self.forward_features(x)
+        return features, self.classify_features(features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classify_features(self.forward_features(x))
 
 
 @dataclass
@@ -213,3 +223,40 @@ def average_weighted_deltas(weighted_deltas: Iterable[Tuple[float, Dict[str, tor
 def model_memory_mb(model: nn.Module) -> float:
     params = sum(p.numel() for p in model.parameters())
     return params * 4 / (1024 ** 2)
+
+
+def estimate_model_flops(model: nn.Module, input_shape: Tuple[int, int, int, int] = (1, 3, 32, 32)) -> float:
+    flops = 0.0
+    hooks = []
+
+    def conv_hook(module: nn.Conv2d, inputs, output) -> None:
+        nonlocal flops
+        batch_size = inputs[0].shape[0]
+        output_height, output_width = output.shape[-2:]
+        kernel_ops = module.kernel_size[0] * module.kernel_size[1] * (module.in_channels / module.groups)
+        flops += float(batch_size * output_height * output_width * module.out_channels * kernel_ops)
+
+    def linear_hook(module: nn.Linear, inputs, output) -> None:
+        nonlocal flops
+        batch_size = inputs[0].shape[0]
+        flops += float(batch_size * module.in_features * module.out_features)
+
+    for module in model.modules():
+        if isinstance(module, nn.Conv2d):
+            hooks.append(module.register_forward_hook(conv_hook))
+        elif isinstance(module, nn.Linear):
+            hooks.append(module.register_forward_hook(linear_hook))
+
+    was_training = model.training
+    device = next(model.parameters()).device
+    dummy = torch.zeros(input_shape, device=device)
+    with torch.no_grad():
+        model.eval()
+        model(dummy)
+    if was_training:
+        model.train()
+
+    for hook in hooks:
+        hook.remove()
+
+    return flops / max(float(input_shape[0]), 1.0)

@@ -12,20 +12,21 @@ dataset:
   simple_easy_ratio: 0.90
   complex_easy_ratio: 0.30
   batch_size: 128
-  num_workers: 0
-  difficulty_checkpoint:
+  num_workers: 4
+  difficulty_checkpoint: ./artifacts/checkpoints/cifar10_resnet18_teacher.pt
   partition_cache_name: client_partitions.json
-  public_dataset_size: 1000
+  public_dataset_size: 0
   public_split_strategy: random
 
 federated:
-  server_algorithm: fedegs2
+  server_algorithm: fedegs
   client_algorithm: sgd_expert_local
   compare_algorithms:
     - fedavg
     - fedprox
+    - ideal
   sequential_simulation: true
-  rounds: 50
+  rounds: 100
   clients_per_round: 10
   local_epochs: 5
   local_lr: 0.01
@@ -35,6 +36,9 @@ federated:
   distill_epochs: 2
   distill_lr: 0.01
   distill_temperature: 2.0
+  feature_align_weight: 1.0
+  logit_align_weight: 1.0
+  feature_noise_std: 0.01
   device: cuda
   seed: 42
 
@@ -43,8 +47,13 @@ model:
   num_classes: 10
   general_width: 1.0
   expert_width: 0.25
+  expert_base_channels: 32
+  baseline_architecture: width_scalable_resnet18
+  baseline_width: 0.25
+  baseline_base_channels: 32
 
 inference:
-  routing_policy: dual_threshold_general_fallback
-  high_threshold: 0.85
+  routing_policy: confidence_general_fallback
+  confidence_threshold: 0.80
+  high_threshold: 0.80
   low_threshold: 0.30

@@ -34,8 +34,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--difficulty-checkpoint", default=None)
+    parser.add_argument("--routing-threshold", dest="routing_threshold", type=float, default=None)
     parser.add_argument("--high-threshold", type=float, default=None)
     parser.add_argument("--low-threshold", type=float, default=None)
+    parser.add_argument("--route-distance-threshold", dest="route_distance_threshold", type=float, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--prox-mu", dest="prox_mu", type=float, default=None)
     return parser
@@ -45,27 +47,11 @@ def sanitize_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]+", "_", name).strip("_") or "experiment"
 
 
-def _run_name_conflicts(output_dir: str, experiment_name: str, run_name: str, run_timestamp: str) -> bool:
-    base_output = Path(output_dir)
-    log_path = base_output / "logs" / run_timestamp[:8] / f"{run_name}.log"
-    tensorboard_dir = base_output / "tensorboard" / experiment_name / run_name
-    route_dir = base_output / "routes" / run_name
-    return log_path.exists() or tensorboard_dir.exists() or route_dir.exists()
-
-
-def build_run_identity(experiment_name: str, algorithm_name: str, output_dir: str) -> tuple[str, str]:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+def build_run_identity(experiment_name: str, algorithm_name: str) -> tuple[str, str]:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_experiment = sanitize_name(experiment_name)
     safe_algorithm = sanitize_name(algorithm_name)
-    base_name = f"{safe_experiment}_{safe_algorithm}_{timestamp}"
-    run_name = base_name
-    suffix = 1
-
-    while _run_name_conflicts(output_dir, experiment_name, run_name, timestamp):
-        run_name = f"{base_name}_{suffix:02d}"
-        suffix += 1
-
-    return run_name, timestamp
+    return f"{safe_experiment}_{safe_algorithm}_{timestamp}", timestamp
 
 
 def configure_logging(log_dir: str, run_name: str) -> Path:
@@ -98,17 +84,15 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         "batch_size": args.batch_size,
         "device": args.device,
         "difficulty_checkpoint": args.difficulty_checkpoint,
+        "routing_threshold": args.routing_threshold,
         "high_threshold": args.high_threshold,
         "low_threshold": args.low_threshold,
+        "route_distance_threshold": args.route_distance_threshold,
         "num_workers": args.num_workers,
         "prox_mu": args.prox_mu,
     }
     config = apply_cli_overrides(config, overrides)
-    run_name, run_timestamp = build_run_identity(
-        config.experiment_name,
-        config.federated.server_algorithm,
-        config.output_dir,
-    )
+    run_name, run_timestamp = build_run_identity(config.experiment_name, config.federated.server_algorithm)
     config = build_runtime_paths(config, run_name=run_name, run_timestamp=run_timestamp)
     config.ensure_dirs()
     return config
