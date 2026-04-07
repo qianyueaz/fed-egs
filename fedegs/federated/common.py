@@ -1,7 +1,7 @@
 import csv
 import logging
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -16,11 +16,22 @@ LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
+class HyperKnowledge:
+    features: Dict[int, torch.Tensor] = field(default_factory=dict)
+    soft_predictions: Dict[int, torch.Tensor] = field(default_factory=dict)
+    counts: Dict[int, int] = field(default_factory=dict)
+
+    def is_empty(self) -> bool:
+        return not self.counts
+
+
+@dataclass
 class ClientUpdate:
     client_id: str
     num_samples: int
     loss: float
     delta: Dict[str, torch.Tensor]
+    hyper_knowledge: Optional[HyperKnowledge] = None
 
 
 @dataclass
@@ -30,6 +41,16 @@ class RoundMetrics:
     routed_accuracy: float
     hard_accuracy: float
     invocation_rate: float
+    local_accuracy: float = 0.0
+    compute_savings: float = 0.0
+
+    @property
+    def global_accuracy(self) -> float:
+        return self.routed_accuracy
+
+    @property
+    def hard_recall(self) -> float:
+        return self.hard_accuracy
 
 
 class BaseFederatedClient:
@@ -104,60 +125,75 @@ class BaseFederatedServer:
         self.client_datasets = client_datasets
         self.client_test_datasets = client_test_datasets
         self.public_dataset = public_dataset
+        self.routing_threshold = (
+            config.inference.confidence_threshold
+            if config.inference.confidence_threshold is not None
+            else config.inference.high_threshold
+        )
 
-    def _dual_threshold_route(
+    def _confidence_route(
         self,
         expert_model: nn.Module,
         general_model: nn.Module,
         images: torch.Tensor,
+        confidence_threshold: Optional[float] = None,
+        margin_threshold: Optional[float] = None,
     ) -> Tuple[torch.Tensor, int, Dict[str, object]]:
-        high_threshold = self.config.inference.high_threshold
-        low_threshold = self.config.inference.low_threshold
-        if high_threshold <= low_threshold:
-            raise ValueError(
-                f"Expected high_threshold > low_threshold, got high={high_threshold} low={low_threshold}"
-            )
-
+        threshold = self.routing_threshold if confidence_threshold is None else max(float(confidence_threshold), 0.0)
+        margin_threshold = (
+            max(float(self.config.inference.route_distance_threshold), 0.0)
+            if margin_threshold is None
+            else max(float(margin_threshold), 0.0)
+        )
         expert_model.eval()
         general_model.eval()
 
         expert_logits = expert_model(images)
         expert_probs = torch.softmax(expert_logits, dim=1)
-        expert_confidence, expert_prediction = torch.max(expert_probs, dim=1)
+        topk = torch.topk(expert_probs, k=min(2, expert_probs.size(1)), dim=1)
+        expert_confidence = topk.values[:, 0]
+        expert_prediction = topk.indices[:, 0]
+        if topk.values.size(1) > 1:
+            expert_margin = topk.values[:, 0] - topk.values[:, 1]
+        else:
+            expert_margin = torch.ones_like(expert_confidence)
 
-        high_mask = expert_confidence >= high_threshold
-        low_mask = expert_confidence <= low_threshold
-        mid_mask = ~(high_mask | low_mask)
-
+        fallback_mask = self._build_fallback_mask(
+            expert_confidence=expert_confidence,
+            expert_margin=expert_margin,
+            confidence_threshold=threshold,
+            margin_threshold=margin_threshold,
+        )
         predictions = expert_prediction.clone()
-        invoked_general = 0
+        invoked_general = int(fallback_mask.sum().item())
         route_types = ["expert"] * images.size(0)
-
-        if low_mask.any():
-            low_general_logits = general_model(images[low_mask])
-            predictions[low_mask] = torch.argmax(low_general_logits, dim=1)
-            invoked_general += int(low_mask.sum().item())
-            for sample_idx in low_mask.nonzero(as_tuple=False).flatten().tolist():
+        if fallback_mask.any():
+            general_logits = general_model(images[fallback_mask])
+            predictions[fallback_mask] = torch.argmax(general_logits, dim=1)
+            for sample_idx in fallback_mask.nonzero(as_tuple=False).flatten().tolist():
                 route_types[sample_idx] = "general"
-
-        if mid_mask.any():
-            mid_general_logits = general_model(images[mid_mask])
-            expert_mid_logits = expert_logits[mid_mask]
-            mid_confidence = expert_confidence[mid_mask]
-
-            # Confidence closer to the high threshold trusts the expert more.
-            expert_weight = ((mid_confidence - low_threshold) / (high_threshold - low_threshold)).clamp(0.0, 1.0)
-            fused_logits = expert_weight.unsqueeze(1) * expert_mid_logits + (1.0 - expert_weight.unsqueeze(1)) * mid_general_logits
-            predictions[mid_mask] = torch.argmax(fused_logits, dim=1)
-            invoked_general += int(mid_mask.sum().item())
-            for sample_idx in mid_mask.nonzero(as_tuple=False).flatten().tolist():
-                route_types[sample_idx] = "fusion"
 
         metadata = {
             "route_type": route_types,
             "expert_confidence": expert_confidence.detach().cpu().tolist(),
         }
         return predictions, invoked_general, metadata
+
+    def _build_fallback_mask(
+        self,
+        expert_confidence: torch.Tensor,
+        expert_margin: torch.Tensor,
+        confidence_threshold: float,
+        margin_threshold: float,
+    ) -> torch.Tensor:
+        confidence_delta = max(float(self.config.inference.route_hard_confidence_delta), 0.0)
+        margin_delta = max(float(self.config.inference.route_hard_margin_delta), 0.0)
+        base_mask = (expert_confidence < confidence_threshold) | (expert_margin < margin_threshold)
+        hard_proxy_mask = (
+            (expert_confidence < confidence_threshold + confidence_delta)
+            & (expert_margin < margin_threshold + margin_delta)
+        )
+        return base_mask | hard_proxy_mask
 
     def _sample_client_ids(self) -> List[str]:
         return self.random.sample(
@@ -195,16 +231,6 @@ class BaseFederatedServer:
     ) -> Dict[str, object]:
         client_results: Dict[str, Dict[str, float]] = {}
         route_records: List[Dict[str, object]] = []
-        weighted_sums = {
-            "accuracy": 0.0,
-            "hard_accuracy": 0.0,
-            "precision_macro": 0.0,
-            "recall_macro": 0.0,
-            "f1_macro": 0.0,
-            "invocation_rate": 0.0,
-        }
-        total_samples = 0
-
         for client_id, dataset in self.client_test_datasets.items():
             loader = self.data_module.make_loader(dataset, shuffle=False)
             client_metrics = self._evaluate_predictor_on_loader(
@@ -215,19 +241,65 @@ class BaseFederatedServer:
             )
             route_records.extend(client_metrics.pop("_route_records", []))
             client_results[client_id] = client_metrics
-            sample_count = client_metrics["num_samples"]
-            total_samples += sample_count
-            for key in weighted_sums:
-                weighted_sums[key] += client_metrics[key] * sample_count
 
-        aggregated = {key: weighted_sums[key] / max(total_samples, 1) for key in weighted_sums}
-        aggregated["num_clients"] = len(client_results)
-        aggregated["num_samples"] = total_samples
-
-        self._log_client_metrics_table(prefix, client_results, aggregated)
+        weighted = self._aggregate_metrics(client_results, weighted=True)
+        macro = self._aggregate_metrics(client_results, weighted=False)
+        groups = self._aggregate_group_metrics(client_results)
+        self._log_client_metrics_table(prefix, client_results, weighted, macro, groups)
         if route_export_path is not None:
             self._write_route_records_csv(route_export_path, route_records)
-        return {"aggregate": aggregated, "clients": client_results}
+        return {
+            "aggregate": weighted,
+            "macro": macro,
+            "groups": groups,
+            "clients": client_results,
+        }
+
+    def _aggregate_metrics(self, client_results: Dict[str, Dict[str, float]], weighted: bool) -> Dict[str, float]:
+        metric_keys = ("accuracy", "hard_recall", "precision_macro", "recall_macro", "f1_macro", "invocation_rate")
+        if not client_results:
+            return {
+                **{key: 0.0 for key in metric_keys},
+                "hard_accuracy": 0.0,
+                "num_clients": 0,
+                "num_samples": 0,
+                "num_hard_samples": 0,
+            }
+
+        accumulator = {key: 0.0 for key in metric_keys}
+        total_weight = 0.0
+        total_samples = 0
+        total_hard_samples = 0
+
+        for metrics in client_results.values():
+            weight = float(metrics["num_samples"] if weighted else 1.0)
+            total_weight += weight
+            total_samples += int(metrics["num_samples"])
+            total_hard_samples += int(metrics["num_hard_samples"])
+            for key in metric_keys:
+                accumulator[key] += metrics[key] * weight
+
+        aggregated = {key: accumulator[key] / max(total_weight, 1.0) for key in metric_keys}
+        aggregated["hard_accuracy"] = aggregated["hard_recall"]
+        aggregated["num_clients"] = len(client_results)
+        aggregated["num_samples"] = total_samples
+        aggregated["num_hard_samples"] = total_hard_samples
+        return aggregated
+
+    def _aggregate_group_metrics(self, client_results: Dict[str, Dict[str, float]]) -> Dict[str, Dict[str, float]]:
+        grouped: Dict[str, Dict[str, Dict[str, float]]] = {}
+        for client_id, metrics in client_results.items():
+            if client_id.startswith("simple_"):
+                group_name = "simple"
+            elif client_id.startswith("complex_"):
+                group_name = "complex"
+            else:
+                group_name = "other"
+            grouped.setdefault(group_name, {})[client_id] = metrics
+        return {
+            group_name: self._aggregate_metrics(metrics_map, weighted=True)
+            for group_name, metrics_map in grouped.items()
+        }
 
     def _evaluate_predictor_on_loader(
         self,
@@ -288,8 +360,10 @@ class BaseFederatedServer:
 
         metrics = self._classification_metrics(all_predictions, all_targets)
         hard_metrics = self._classification_metrics(hard_predictions, hard_targets) if hard_targets else {"accuracy": 0.0}
+        metrics["hard_recall"] = hard_metrics["accuracy"]
         metrics["hard_accuracy"] = hard_metrics["accuracy"]
         metrics["invocation_rate"] = invoked_general / max(len(all_targets), 1)
+        metrics["num_hard_samples"] = len(hard_targets)
         if collect_route_records:
             metrics["_route_records"] = route_records
         return metrics
@@ -334,27 +408,45 @@ class BaseFederatedServer:
             "num_samples": int(total),
         }
 
-    def _log_client_metrics_table(self, prefix: str, client_results: Dict[str, Dict[str, float]], aggregated: Dict[str, float]) -> None:
+    def _log_client_metrics_table(
+        self,
+        prefix: str,
+        client_results: Dict[str, Dict[str, float]],
+        weighted: Dict[str, float],
+        macro: Dict[str, float],
+        groups: Dict[str, Dict[str, float]],
+    ) -> None:
         LOGGER.info(
-            "%s personalized aggregate | clients=%d | samples=%d | acc=%.4f | hard_acc=%.4f | prec=%.4f | recall=%.4f | f1=%.4f | invocation=%.4f",
+            "%s weighted | clients=%d | samples=%d | acc=%.4f | local_acc=%.4f | hard_recall=%.4f | prec=%.4f | recall=%.4f | f1=%.4f | invocation=%.4f",
             prefix,
-            aggregated["num_clients"],
-            aggregated["num_samples"],
-            aggregated["accuracy"],
-            aggregated["hard_accuracy"],
-            aggregated["precision_macro"],
-            aggregated["recall_macro"],
-            aggregated["f1_macro"],
-            aggregated["invocation_rate"],
+            weighted["num_clients"],
+            weighted["num_samples"],
+            weighted["accuracy"],
+            macro["accuracy"],
+            weighted["hard_recall"],
+            weighted["precision_macro"],
+            weighted["recall_macro"],
+            weighted["f1_macro"],
+            weighted["invocation_rate"],
         )
+        for group_name, metrics in sorted(groups.items()):
+            LOGGER.info(
+                "%s group=%s | samples=%d | acc=%.4f | hard_recall=%.4f | invocation=%.4f",
+                prefix,
+                group_name,
+                metrics["num_samples"],
+                metrics["accuracy"],
+                metrics["hard_recall"],
+                metrics["invocation_rate"],
+            )
         for client_id, metrics in sorted(client_results.items()):
             LOGGER.info(
-                "%s client=%s | n=%d | acc=%.4f | hard_acc=%.4f | prec=%.4f | recall=%.4f | f1=%.4f | invocation=%.4f",
+                "%s client=%s | n=%d | acc=%.4f | hard_recall=%.4f | prec=%.4f | recall=%.4f | f1=%.4f | invocation=%.4f",
                 prefix,
                 client_id,
                 metrics["num_samples"],
                 metrics["accuracy"],
-                metrics["hard_accuracy"],
+                metrics["hard_recall"],
                 metrics["precision_macro"],
                 metrics["recall_macro"],
                 metrics["f1_macro"],
@@ -366,15 +458,17 @@ class BaseFederatedServer:
             return
         self.writer.add_scalar(f"loss/{prefix}", metrics.avg_client_loss, metrics.round_idx)
         self.writer.add_scalar(f"accuracy/{prefix}", metrics.routed_accuracy, metrics.round_idx)
+        self.writer.add_scalar(f"local_accuracy/{prefix}", metrics.local_accuracy, metrics.round_idx)
         self.writer.add_scalar(f"hard_accuracy/{prefix}", metrics.hard_accuracy, metrics.round_idx)
         self.writer.add_scalar(f"invocation_rate/{prefix}", metrics.invocation_rate, metrics.round_idx)
+        self.writer.add_scalar(f"compute_savings/{prefix}", metrics.compute_savings, metrics.round_idx)
 
-        # Keep comparison tags stable across separate runs so TensorBoard can overlay
-        # FedAvg/FedProx/FedEGS* directly in the same chart without creating extra pseudo-runs.
-        self.writer.add_scalar("compare/loss", metrics.avg_client_loss, metrics.round_idx)
-        self.writer.add_scalar("compare/accuracy", metrics.routed_accuracy, metrics.round_idx)
-        self.writer.add_scalar("compare/hard_accuracy", metrics.hard_accuracy, metrics.round_idx)
-        self.writer.add_scalar("compare/invocation_rate", metrics.invocation_rate, metrics.round_idx)
+        self.writer.add_scalar(f"compare/{prefix}/loss", metrics.avg_client_loss, metrics.round_idx)
+        self.writer.add_scalar(f"compare/{prefix}/accuracy", metrics.routed_accuracy, metrics.round_idx)
+        self.writer.add_scalar(f"compare/{prefix}/local_accuracy", metrics.local_accuracy, metrics.round_idx)
+        self.writer.add_scalar(f"compare/{prefix}/hard_accuracy", metrics.hard_accuracy, metrics.round_idx)
+        self.writer.add_scalar(f"compare/{prefix}/invocation_rate", metrics.invocation_rate, metrics.round_idx)
+        self.writer.add_scalar(f"compare/{prefix}/compute_savings", metrics.compute_savings, metrics.round_idx)
 
     def _log_auxiliary_accuracy_metrics(
         self,
@@ -387,5 +481,28 @@ class BaseFederatedServer:
             return
         self.writer.add_scalar(f"expert_accuracy/{prefix}", expert_accuracy, round_idx)
         self.writer.add_scalar(f"general_accuracy/{prefix}", general_accuracy, round_idx)
-        self.writer.add_scalar("compare/expert_accuracy", expert_accuracy, round_idx)
-        self.writer.add_scalar("compare/general_accuracy", general_accuracy, round_idx)
+        self.writer.add_scalar(f"compare/{prefix}/expert_accuracy", expert_accuracy, round_idx)
+        self.writer.add_scalar(f"compare/{prefix}/general_accuracy", general_accuracy, round_idx)
+
+    def _build_compute_profile(
+        self,
+        expert_flops: float,
+        general_flops: float,
+        invocation_rate: float,
+        mode: str = "routed",
+    ) -> Dict[str, float]:
+        if mode == "general_only":
+            average_flops = general_flops
+        elif mode == "expert_only":
+            average_flops = expert_flops
+        else:
+            average_flops = expert_flops + invocation_rate * general_flops
+
+        savings_ratio = 1.0 - (average_flops / max(general_flops, 1e-8))
+        return {
+            "expert_flops": expert_flops,
+            "general_flops": general_flops,
+            "average_flops": average_flops,
+            "invocation_rate": invocation_rate,
+            "savings_ratio": savings_ratio,
+        }

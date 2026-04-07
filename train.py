@@ -34,8 +34,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--difficulty-checkpoint", default=None)
+    parser.add_argument("--routing-threshold", dest="routing_threshold", type=float, default=None)
     parser.add_argument("--high-threshold", type=float, default=None)
     parser.add_argument("--low-threshold", type=float, default=None)
+    parser.add_argument("--route-distance-threshold", dest="route_distance_threshold", type=float, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--prox-mu", dest="prox_mu", type=float, default=None)
     return parser
@@ -82,8 +84,10 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         "batch_size": args.batch_size,
         "device": args.device,
         "difficulty_checkpoint": args.difficulty_checkpoint,
+        "routing_threshold": args.routing_threshold,
         "high_threshold": args.high_threshold,
         "low_threshold": args.low_threshold,
+        "route_distance_threshold": args.route_distance_threshold,
         "num_workers": args.num_workers,
         "prox_mu": args.prox_mu,
     }

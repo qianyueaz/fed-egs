@@ -50,7 +50,7 @@ python train.py --config configs/fedegs_cifar10.yaml
 
 ## FedEGS-2
 
-`FedEGS-2` keeps the original routed inference policy, but replaces sliced expert training with a compact personalized CNN on each client. Clients upload logits on a small public CIFAR-10 subset, and the server distills the general `WidthScalableResNet18` on that public data.
+`FedEGS-2` keeps the original routed inference policy, but replaces sliced expert training with a compact personalized CNN on each client. Clients upload logits on a small public CIFAR-10 subset, and the server distills the general `WidthScalableResNet18` on that public data. The public split can be sampled either as a random subset or as a class-balanced per-class ratio.
 
 Example:
 
@@ -66,4 +66,13 @@ federated:
 
 dataset:
   public_dataset_size: 1000
+```
+
+For a class-balanced public split, for example 5% from each CIFAR-10 class:
+
+```yaml
+dataset:
+  public_split_strategy: per_class_ratio
+  public_per_class_ratio: 0.05
+  public_dataset_size: 0
 ```

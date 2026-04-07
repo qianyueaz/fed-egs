@@ -16,6 +16,8 @@ def save_metrics(output_dir: str, history: List[RoundMetrics], results: Dict[str
             "routed_accuracy": item.routed_accuracy,
             "hard_accuracy": item.hard_accuracy,
             "invocation_rate": item.invocation_rate,
+            "local_accuracy": item.local_accuracy,
+            "compute_savings": item.compute_savings,
         }
         for item in history
     ]

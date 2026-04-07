@@ -13,9 +13,9 @@ dataset:
   complex_easy_ratio: 0.30
   batch_size: 128
   num_workers: 8
-  difficulty_checkpoint:
+  difficulty_checkpoint: ./artifacts/checkpoints/cifar10_resnet18_teacher.pt
   partition_cache_name: client_partitions.json
-  public_dataset_size: 1000
+  public_dataset_size: 0
   public_split_strategy: random
 
 federated:
@@ -46,6 +46,7 @@ model:
   baseline_base_channels: 32
 
 inference:
-  routing_policy: dual_threshold_general_fallback
-  high_threshold: 0.85
+  routing_policy: confidence_general_fallback
+  confidence_threshold: 0.80
+  high_threshold: 0.80
   low_threshold: 0.30
