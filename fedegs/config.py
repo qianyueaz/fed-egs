@@ -76,6 +76,14 @@ class FederatedConfig:
     general_distill_max_scale: float = 0.25
     general_freeze_patience: int = 15
     general_init_from_teacher: bool = False
+    general_pretrain_on_public: bool = False
+    general_pretrain_epochs: int = 10
+    general_pretrain_lr: float = 0.01
+    general_pretrain_imagenet_init: bool = False
+    baseline_match_general_capacity: bool = False
+    baseline_match_general_resources: bool = False
+    fedavg_use_expert_model: bool = False
+    fedavg_pretrain_on_public: bool = False
     restore_best_checkpoint: bool = True
     device: str = "cuda"
     seed: int = 42

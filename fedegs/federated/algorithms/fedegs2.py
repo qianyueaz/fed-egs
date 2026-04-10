@@ -45,10 +45,12 @@ class DistilledGeneralModel(nn.Module):
         num_classes: int,
         knowledge_dim: int,
         checkpoint_path: Optional[str] = None,
+        pretrained_imagenet: bool = False,
     ) -> None:
         super().__init__()
-        backbone = build_teacher_model(num_classes=num_classes)
+        backbone = build_teacher_model(num_classes=num_classes, pretrained_imagenet=pretrained_imagenet)
         self.initialized_from_teacher = False
+        self.initialized_from_imagenet = pretrained_imagenet
         if checkpoint_path:
             checkpoint = Path(checkpoint_path)
             if checkpoint.exists():
@@ -58,6 +60,8 @@ class DistilledGeneralModel(nn.Module):
                 LOGGER.info("Initialized shared general model from %s", checkpoint)
             else:
                 LOGGER.warning("General model checkpoint not found at %s. Using random initialization.", checkpoint)
+        if pretrained_imagenet and not self.initialized_from_teacher:
+            LOGGER.info("Initialized general model backbone from ImageNet pretrained weights.")
 
         self.num_classes = num_classes
         self.feature_dim = backbone.fc.in_features
@@ -446,6 +450,7 @@ class FedEGS2Server(BaseFederatedServer):
                 if bool(config.federated.general_init_from_teacher)
                 else None
             ),
+            pretrained_imagenet=bool(config.federated.general_pretrain_imagenet_init),
         ).to(self.device)
         if self.general_model.initialized_from_teacher:
             self.anchor_model = copy.deepcopy(self.general_model).to(self.device)
@@ -498,7 +503,90 @@ class FedEGS2Server(BaseFederatedServer):
             client_id: base_margin for client_id in client_datasets.keys()
         }
 
+    def _pretrain_general_on_public(self) -> None:
+        pretrain_epochs = max(int(self.config.federated.general_pretrain_epochs), 0)
+        if pretrain_epochs == 0:
+            return
+
+        pretrain_lr = float(self.config.federated.general_pretrain_lr)
+        LOGGER.info(
+            "fedegs2 pretrain general model on public dataset | epochs=%d | lr=%.4f | imagenet_init=%s",
+            pretrain_epochs,
+            pretrain_lr,
+            self.general_model.initialized_from_imagenet,
+        )
+
+        optimizer = torch.optim.SGD(
+            self.general_model.parameters(),
+            lr=pretrain_lr,
+            momentum=0.9,
+            weight_decay=float(self.config.federated.local_weight_decay),
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=pretrain_epochs)
+        criterion = torch.nn.CrossEntropyLoss()
+
+        shuffle_loader = self.data_module.make_loader(self.public_dataset, shuffle=True)
+
+        best_acc = -1.0
+        best_state = None
+
+        for epoch in range(1, pretrain_epochs + 1):
+            self.general_model.train()
+            total_loss = 0.0
+            total_correct = 0
+            total_samples = 0
+
+            for images, targets, _ in shuffle_loader:
+                images = images.to(self.device)
+                targets = targets.to(self.device)
+
+                optimizer.zero_grad(set_to_none=True)
+                logits = self.general_model(images)
+                loss = criterion(logits, targets)
+                loss.backward()
+                optimizer.step()
+
+                total_loss += float(loss.detach().cpu().item()) * targets.size(0)
+                total_correct += int((logits.argmax(dim=1) == targets).sum().item())
+                total_samples += targets.size(0)
+
+            scheduler.step()
+            epoch_loss = total_loss / max(total_samples, 1)
+            epoch_acc = total_correct / max(total_samples, 1)
+            LOGGER.info(
+                "fedegs2 pretrain epoch %d/%d | loss=%.4f | acc=%.4f",
+                epoch,
+                pretrain_epochs,
+                epoch_loss,
+                epoch_acc,
+            )
+
+            if epoch_acc > best_acc:
+                best_acc = epoch_acc
+                best_state = {k: v.detach().cpu().clone() for k, v in self.general_model.state_dict().items()}
+
+        if best_state is not None:
+            self.general_model.load_state_dict(best_state)
+            LOGGER.info("fedegs2 pretrain complete | best_acc=%.4f | restoring best state", best_acc)
+
+        # Create anchor model from pretrained state if one doesn't exist yet
+        if self.anchor_model is None and float(self.config.federated.general_anchor_weight) > 0:
+            self.anchor_model = copy.deepcopy(self.general_model).to(self.device)
+            self.anchor_model.eval()
+            for parameter in self.anchor_model.parameters():
+                parameter.requires_grad_(False)
+            LOGGER.info("fedegs2 created anchor model from pretrained general model")
+
+        # Re-initialize the distill optimizer with fresh state for the federated phase
+        self.distill_optimizer = torch.optim.Adam(
+            self.general_model.parameters(),
+            lr=self.config.federated.distill_lr,
+            weight_decay=self.config.federated.local_weight_decay,
+        )
+
     def train(self, test_dataset: Dataset) -> List[RoundMetrics]:
+        if bool(self.config.federated.general_pretrain_on_public):
+            self._pretrain_general_on_public()
         metrics: List[RoundMetrics] = []
         for round_idx in range(1, self.config.federated.rounds + 1):
             sampled_ids = self._sample_client_ids()

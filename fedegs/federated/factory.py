@@ -11,9 +11,33 @@ def create_federated_server(name: str, config, client_datasets, client_test_data
     if normalized in {"fedegs2", "fedegs-2"}:
         return FedEGS2Server(config, client_datasets, client_test_datasets, data_module, test_hard_indices, writer, public_dataset=public_dataset)
     if normalized == "fedavg":
-        return FedAvgServer(config, client_datasets, client_test_datasets, data_module, test_hard_indices, writer)
+        return FedAvgServer(
+            config,
+            client_datasets,
+            client_test_datasets,
+            data_module,
+            test_hard_indices,
+            writer,
+            public_dataset=public_dataset,
+        )
     if normalized in {"ideal", "ideal_upper_bound", "fat_client"}:
-        return FedAvgServer(config, client_datasets, client_test_datasets, data_module, test_hard_indices, writer)
+        return FedAvgServer(
+            config,
+            client_datasets,
+            client_test_datasets,
+            data_module,
+            test_hard_indices,
+            writer,
+            public_dataset=public_dataset,
+        )
     if normalized == "fedprox":
-        return FedProxServer(config, client_datasets, client_test_datasets, data_module, test_hard_indices, writer)
+        return FedProxServer(
+            config,
+            client_datasets,
+            client_test_datasets,
+            data_module,
+            test_hard_indices,
+            writer,
+            public_dataset=public_dataset,
+        )
     raise ValueError(f"Unsupported federated algorithm: {name}")

@@ -5,6 +5,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from fedegs.federated.common import BaseFederatedClient, BaseFederatedServer, ClientUpdate, RoundMetrics, LOGGER
+from fedegs.federated.algorithms.baseline_support import build_server_baseline_model, prepare_server_model
 from fedegs.models import SmallCNN, average_weighted_deltas, build_model, estimate_model_flops, model_memory_mb
 from fedegs.models.width_scalable_resnet import state_dict_delta
 
@@ -35,13 +36,51 @@ class FedAvgClient(BaseFederatedClient):
 
 
 class FedAvgServer(BaseFederatedServer):
-    def __init__(self, config, client_datasets: Dict[str, Dataset], client_test_datasets: Dict[str, Dataset], data_module, test_hard_indices, writer=None) -> None:
-        super().__init__(config, client_datasets, client_test_datasets, data_module, test_hard_indices, writer)
-        self.global_model = SmallCNN(
-            num_classes=config.model.num_classes,
-            base_channels=config.model.expert_base_channels,
-            knowledge_dim=config.model.knowledge_dim,
-        ).to(self.device)
+    def __init__(
+        self,
+        config,
+        client_datasets: Dict[str, Dataset],
+        client_test_datasets: Dict[str, Dataset],
+        data_module,
+        test_hard_indices,
+        writer=None,
+        public_dataset: Dataset | None = None,
+    ) -> None:
+        super().__init__(
+            config,
+            client_datasets,
+            client_test_datasets,
+            data_module,
+            test_hard_indices,
+            writer,
+            public_dataset=public_dataset,
+        )
+        if bool(config.federated.fedavg_use_expert_model):
+            LOGGER.info("fedavg uses expert-matched SmallCNN backbone.")
+            self.global_model = prepare_server_model(
+                model=SmallCNN(
+                    num_classes=config.model.num_classes,
+                    base_channels=config.model.expert_base_channels,
+                    knowledge_dim=config.model.knowledge_dim,
+                ),
+                config=config,
+                device=self.device,
+                data_module=data_module,
+                public_dataset=public_dataset,
+                algorithm_name="fedavg",
+                writer=writer,
+                enable_external_weight_init=False,
+                enable_public_pretrain=bool(config.federated.fedavg_pretrain_on_public),
+            )
+        else:
+            self.global_model = build_server_baseline_model(
+                config=config,
+                device=self.device,
+                data_module=data_module,
+                public_dataset=public_dataset,
+                algorithm_name="fedavg",
+                writer=writer,
+            )
         reference_general_model = build_model(
             architecture=config.model.architecture,
             num_classes=config.model.num_classes,

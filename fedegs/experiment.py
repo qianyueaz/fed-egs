@@ -42,6 +42,7 @@ def _run_single_algorithm(algorithm_name: str, config, data_bundle, data_module,
     run_config.federated.server_algorithm = algorithm_name
     if normalized in {"ideal", "ideal_upper_bound", "fat_client"}:
         run_config.federated.server_algorithm = "fedavg"
+        run_config.federated.fedavg_use_expert_model = False
         run_config.model.baseline_architecture = run_config.model.architecture
         run_config.model.baseline_width = run_config.model.general_width
         run_config.model.baseline_base_channels = run_config.model.expert_base_channels

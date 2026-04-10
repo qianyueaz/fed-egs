@@ -27,7 +27,7 @@ federated:
     - fedprox
     - ideal
   sequential_simulation: true
-  rounds: 180
+  rounds: 200
   clients_per_round: 10
   local_epochs: 7
   local_lr: 0.01
@@ -60,12 +60,20 @@ federated:
   min_uncertainty_weight: 0.2
   min_client_reliability: 0.05
   prototype_momentum: 0.7
-  general_anchor_weight: 0.0
+  general_anchor_weight: 0.3
   general_warmup_rounds: 20
   general_distill_ramp_rounds: 20
   general_distill_max_scale: 0.15
   general_freeze_patience: 15
   general_init_from_teacher: false
+  general_pretrain_on_public: true
+  general_pretrain_epochs: 20
+  general_pretrain_lr: 0.01
+  general_pretrain_imagenet_init: true
+  baseline_match_general_capacity: true
+  baseline_match_general_resources: true
+  fedavg_use_expert_model: true
+  fedavg_pretrain_on_public: true
   restore_best_checkpoint: true
   device: cuda
   seed: 42
@@ -78,7 +86,7 @@ model:
   expert_base_channels: 32
   knowledge_dim: 512
   baseline_architecture: width_scalable_resnet18
-  baseline_width: 0.25
+  baseline_width: 1.0
   baseline_base_channels: 32
 
 inference:

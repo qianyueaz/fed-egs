@@ -76,3 +76,19 @@ dataset:
   public_per_class_ratio: 0.05
   public_dataset_size: 0
 ```
+
+For a resource-matched baseline comparison, enable the baseline to reuse the same model capacity, external initialization, and public-data pretraining budget as the `general` model:
+
+```yaml
+federated:
+  baseline_match_general_capacity: true
+  baseline_match_general_resources: true
+```
+
+For an expert-matched `FedAvg` baseline, switch `FedAvg` itself to `SmallCNN` and pretrain it on the public dataset before federated rounds:
+
+```yaml
+federated:
+  fedavg_use_expert_model: true
+  fedavg_pretrain_on_public: true
+```
