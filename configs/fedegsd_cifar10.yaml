@@ -1,0 +1,114 @@
+experiment_name: compare_fedegsd_cifar10
+output_dir: ./artifacts
+
+dataset:
+  name: cifar10
+  root: ./data
+  partition_strategy: difficulty_skewed
+  num_clients: 20
+  simple_clients: 10
+  complex_clients: 10
+  hard_ratio: 0.30
+  simple_easy_ratio: 0.90
+  complex_easy_ratio: 0.30
+  batch_size: 128
+  num_workers: 8
+  difficulty_checkpoint: ./artifacts/checkpoints/cifar10_resnet18_teacher.pt
+  partition_cache_name: client_partitions.json
+  public_dataset_size: 0
+  public_split_strategy: per_class_ratio
+  public_per_class_ratio: 0.05
+
+federated:
+  server_algorithm: fedegsd
+  client_algorithm: sgd_expert_local
+  compare_algorithms:
+    - fedavg
+    - fedprox
+  sequential_simulation: true
+  rounds: 180
+  clients_per_round: 10
+  local_epochs: 7
+  local_lr: 0.01
+  local_momentum: 0.9
+  local_weight_decay: 0.0005
+  prox_mu: 0.001
+  # --- Server-side distillation ---
+  distill_epochs: 3
+  distill_lr: 0.001
+  distill_temperature: 3.0
+  logit_align_weight: 1.0
+  # --- Feature/relation not used in FedEGS-D (server-side only) ---
+  feature_align_weight: 0.0
+  relation_align_weight: 0.0
+  # --- Client-side KD not used (clients only do CE) ---
+  client_kd_weight: 0.0
+  client_kd_temperature: 3.0
+  client_feature_hint_weight: 0.0
+  client_hard_weight: 0.0
+  client_hard_focus_power: 1.0
+  client_hard_margin_threshold: 0.20
+  client_hard_extra_weight: 0.0
+  hard_subset_ratio: 0.0
+  hard_subset_kd_boost: 0.0
+  hard_subset_hint_boost: 0.0
+  expert_refresh_epochs: 0
+  expert_refresh_lr_scale: 0.0
+  freeze_expert_refresh_epochs: 0
+  freeze_client_kd_weight: 0.0
+  freeze_client_feature_hint_weight: 0.0
+  freeze_local_lr_scale: 1.0
+  # --- Uncertainty weighting ---
+  min_uncertainty_weight: 0.2
+  min_client_reliability: 0.05
+  feature_noise_std: 0.0
+  prototype_momentum: 0.0
+  # --- General model pretrain (ImageNet init + public data finetune) ---
+  general_anchor_weight: 0.0
+  general_warmup_rounds: 0
+  general_distill_ramp_rounds: 0
+  general_distill_max_scale: 1.0
+  general_freeze_patience: 999
+  general_init_from_teacher: false
+  general_pretrain_on_public: true
+  general_pretrain_epochs: 20
+  general_pretrain_lr: 0.01
+  general_pretrain_imagenet_init: true
+  restore_best_checkpoint: true
+  device: cuda
+  seed: 42
+
+model:
+  architecture: width_scalable_resnet18
+  num_classes: 10
+  general_width: 1.0
+  expert_width: 0.25
+  expert_base_channels: 32
+  knowledge_dim: 512
+  baseline_architecture: width_scalable_resnet18
+  baseline_width: 0.25
+  baseline_base_channels: 32
+
+inference:
+  routing_policy: confidence_general_fallback
+  confidence_threshold: 0.85
+  high_threshold: 0.85
+  low_threshold: 0.85
+  route_distance_threshold: 0.05
+  min_confidence_threshold: 0.50
+  max_confidence_threshold: 0.95
+  min_margin_threshold: 0.00
+  max_margin_threshold: 0.10
+  personalized_threshold_step: 0.01
+  personalized_margin_step: 0.005
+  expert_priority_reliability_floor: 0.32
+  expert_priority_reliability_target: 0.55
+  target_general_invocation_rate: 0.20
+  simple_client_fallback_floor: 0.03
+  complex_client_fallback_floor: 0.10
+  public_teacher_gap_guard: 0.03
+  route_hard_confidence_delta: 0.03
+  route_hard_margin_delta: 0.02
+  route_warmup_rounds: 0
+  route_warmup_confidence_threshold: 0.40
+  route_disable_distance_during_warmup: true
