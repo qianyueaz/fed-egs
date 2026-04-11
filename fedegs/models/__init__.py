@@ -49,9 +49,14 @@ def build_baseline_model(config):
     )
 
 
-def build_teacher_model(num_classes: int = 10) -> nn.Module:
-    model = tv_models.resnet18(weights=None)
+def build_teacher_model(num_classes: int = 10, pretrained_imagenet: bool = False) -> nn.Module:
+    model = tv_models.resnet18(weights=tv_models.ResNet18_Weights.DEFAULT if pretrained_imagenet else None)
+    # Adapt for CIFAR-10 small images: 3x3 conv1 (no 7x7), remove maxpool
+    original_conv1_weight = model.conv1.weight.data if pretrained_imagenet else None
     model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    if pretrained_imagenet and original_conv1_weight is not None:
+        # Center-crop the 7x7 ImageNet kernel to 3x3 for CIFAR adaptation
+        model.conv1.weight.data.copy_(original_conv1_weight[:, :, 2:5, 2:5])
     model.maxpool = nn.Identity()
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     return model

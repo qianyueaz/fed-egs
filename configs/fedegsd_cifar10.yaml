@@ -1,4 +1,4 @@
-experiment_name: compare_fedegsd_cifar10
+experiment_name: fedegsd_cifar10
 output_dir: ./artifacts
 
 dataset:
@@ -15,6 +15,7 @@ dataset:
   num_workers: 8
   difficulty_checkpoint: ./artifacts/checkpoints/cifar10_resnet18_teacher.pt
   partition_cache_name: client_partitions.json
+  # Public data: small subset for routing threshold calibration only
   public_dataset_size: 0
   public_split_strategy: per_class_ratio
   public_per_class_ratio: 0.05
@@ -26,22 +27,32 @@ federated:
     - fedavg
     - fedprox
   sequential_simulation: true
-  rounds: 180
+  rounds: 100
   clients_per_round: 10
-  local_epochs: 7
+  local_epochs: 20
   local_lr: 0.01
   local_momentum: 0.9
   local_weight_decay: 0.0005
   prox_mu: 0.001
-  # --- Server-side distillation ---
-  distill_epochs: 3
+
+  # --- Server-side distillation (FedDF aligned) ---
+  distill_epochs: 5
   distill_lr: 0.001
   distill_temperature: 3.0
   logit_align_weight: 1.0
-  # --- Feature/relation not used in FedEGS-D (server-side only) ---
-  feature_align_weight: 0.0
-  relation_align_weight: 0.0
-  # --- Client-side KD not used (clients only do CE) ---
+
+  # --- External distillation dataset (unlabeled, NOT from CIFAR-10) ---
+  # Options: 'cifar100', 'svhn', 'imagenet32'
+  distill_dataset: cifar100
+  distill_dataset_root: ./data
+  distill_max_samples: 10000
+
+  # --- Expert KD from general model (on private data) ---
+  expert_kd_weight: 1.0
+  expert_kd_temperature: 3.0
+  expert_kd_warmup_rounds: 15
+
+  # --- No client-side KD (pure CE training) ---
   client_kd_weight: 0.0
   client_kd_temperature: 3.0
   client_feature_hint_weight: 0.0
@@ -58,22 +69,25 @@ federated:
   freeze_client_kd_weight: 0.0
   freeze_client_feature_hint_weight: 0.0
   freeze_local_lr_scale: 1.0
-  # --- Uncertainty weighting ---
+  feature_align_weight: 0.0
+  relation_align_weight: 0.0
   min_uncertainty_weight: 0.2
   min_client_reliability: 0.05
   feature_noise_std: 0.0
   prototype_momentum: 0.0
-  # --- General model pretrain (ImageNet init + public data finetune) ---
+
+  # --- NO pretrain (aligned with FedDF cold-start) ---
   general_anchor_weight: 0.0
   general_warmup_rounds: 0
   general_distill_ramp_rounds: 0
   general_distill_max_scale: 1.0
   general_freeze_patience: 999
   general_init_from_teacher: false
-  general_pretrain_on_public: true
-  general_pretrain_epochs: 20
+  general_pretrain_on_public: false
+  general_pretrain_epochs: 0
   general_pretrain_lr: 0.01
-  general_pretrain_imagenet_init: true
+  general_pretrain_imagenet_init: false
+
   restore_best_checkpoint: true
   device: cuda
   seed: 42

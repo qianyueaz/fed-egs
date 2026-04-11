@@ -80,6 +80,12 @@ class FederatedConfig:
     general_pretrain_epochs: int = 10
     general_pretrain_lr: float = 0.01
     general_pretrain_imagenet_init: bool = False
+    distill_dataset: str = "cifar100"
+    distill_dataset_root: str = "./data"
+    distill_max_samples: int = 0
+    expert_kd_weight: float = 0.0
+    expert_kd_temperature: float = 3.0
+    expert_kd_warmup_rounds: int = 10
     restore_best_checkpoint: bool = True
     device: str = "cuda"
     seed: int = 42

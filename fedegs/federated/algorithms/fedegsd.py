@@ -1,33 +1,29 @@
 """
 FedEGS-D: Federated Expert-General System - Decoupled
 
-Core design:
-  - Client trains a lightweight SmallCNN expert on local data (FP32/FP16).
-  - Client uploads expert MODEL PARAMETERS (not logits) to the server.
-  - Server instantiates all received expert models, runs them on a public
-    proxy dataset to extract logits, averages into pseudo-labels.
-  - Server distills these pseudo-labels into a large general model (ResNet-18).
-  - Server quantises general model (simulated INT8) and broadcasts it.
-  - At inference the client first runs the expert; if confidence is low
-    it falls back to the (quantised) general model.
-
-Differences from FedEGS-2:
-  - Clients upload expert *weights*, NOT logits/features on public data.
-  - All public-data inference happens server-side (zero extra client compute).
-  - No feature-hint loss, relation loss, or anchor loss on the client.
-  - Server-side distillation uses simple ensemble averaging + KL divergence.
-  - Simulated INT8 quantisation for the broadcast general model.
+Aligned with FedDF (NeurIPS 2020) ensemble distillation:
+  - Client trains SmallCNN expert on local data (pure CE), uploads weights.
+  - Server instantiates experts, runs on an EXTERNAL UNLABELED proxy dataset
+    (e.g. CIFAR-100 or ImageNet-32, NOT a subset of CIFAR-10 training data).
+  - Server averages raw logits across experts (AVGLOGITS), then applies softmax.
+  - Server distills ensemble soft-labels into general model via pure KL divergence
+    (no CE on true labels — proxy dataset labels are unused / unavailable).
+  - Adam + cosine annealing scheduler for distillation (per FedDF Section 4.1).
+  - At inference: expert-first with confidence routing to general model fallback.
 """
 
 import copy
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+
+from torchvision import datasets, transforms
 
 from fedegs.federated.common import (
     BaseFederatedClient,
@@ -39,7 +35,6 @@ from fedegs.models import (
     SmallCNN,
     build_teacher_model,
     estimate_model_flops,
-    load_teacher_checkpoint,
     model_memory_mb,
 )
 
@@ -58,11 +53,11 @@ class FedEGSDClientUpdate:
 
 
 # ---------------------------------------------------------------------------
-# General model wrapper (reused from fedegs2, simplified)
+# General model wrapper
 # ---------------------------------------------------------------------------
 
 class GeneralModel(nn.Module):
-    """Server-side general model built on top of a ResNet-18 teacher backbone."""
+    """Server-side general model built on a ResNet-18 backbone."""
 
     def __init__(self, num_classes: int, pretrained_imagenet: bool = False) -> None:
         super().__init__()
@@ -85,28 +80,74 @@ class GeneralModel(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# External distillation dataset loader
+# ---------------------------------------------------------------------------
+
+def load_distillation_dataset(
+    name: str,
+    root: str,
+    max_samples: int = 0,
+) -> Dataset:
+    """
+    Load an external unlabeled dataset for server-side ensemble distillation.
+    Labels exist in the object but are NOT used during distillation.
+
+    Supported: 'cifar100', 'svhn', or an ImageFolder path for ImageNet-32.
+    All images are resized/normalised to match CIFAR-10 input distribution.
+    """
+    transform = transforms.Compose([
+        transforms.Resize(32),
+        transforms.CenterCrop(32),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
+    ])
+
+    normalised = name.lower().replace("-", "").replace("_", "")
+
+    if normalised in ("cifar100",):
+        ds = datasets.CIFAR100(root=root, train=True, download=True, transform=transform)
+    elif normalised in ("svhn",):
+        ds = datasets.SVHN(root=root, split="train", download=True, transform=transform)
+    elif normalised in ("imagenet32", "imagenet"):
+        folder = Path(root) / "imagenet32" / "train"
+        if not folder.exists():
+            raise FileNotFoundError(
+                f"ImageNet-32 folder not found at {folder}. "
+                "Download ImageNet-32 and organise as ImageFolder."
+            )
+        ds = datasets.ImageFolder(str(folder), transform=transform)
+    else:
+        folder = Path(root) / name
+        if folder.exists():
+            ds = datasets.ImageFolder(str(folder), transform=transform)
+        else:
+            raise ValueError(f"Unsupported distillation dataset: {name}")
+
+    total = len(ds)
+    if 0 < max_samples < total:
+        ds = torch.utils.data.Subset(ds, list(range(max_samples)))
+
+    LOGGER.info("Distillation dataset '%s': %d samples (max_samples=%d)", name, len(ds), max_samples)
+    return ds
+
+
+# ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
 
 class FedEGSDClient(BaseFederatedClient):
     """
-    Client-side logic for FedEGS-D.
+    Local expert training with optional KD from the general model.
 
-    Each round the client:
-      1. Trains its local expert model on private data (standard CE).
-      2. Returns the expert model state_dict to the server.
-    No public data inference happens on the client.
+    Loss = CE(expert, true_label) + kd_weight * KL(expert, general_soft_label)
+
+    The general model runs in inference-only mode on the client's private data,
+    providing soft labels as a regulariser. This lets the expert absorb global
+    knowledge accumulated in the general model each round, breaking the
+    "information island" problem.
     """
 
-    def __init__(
-        self,
-        client_id: str,
-        dataset: Dataset,
-        num_classes: int,
-        device: str,
-        config,
-        data_module,
-    ) -> None:
+    def __init__(self, client_id, dataset, num_classes, device, config, data_module):
         super().__init__(client_id, dataset, device)
         self.config = config
         self.data_module = data_module
@@ -115,28 +156,90 @@ class FedEGSDClient(BaseFederatedClient):
             base_channels=config.model.expert_base_channels,
         ).to(self.device)
 
-    def train_local(self) -> FedEGSDClientUpdate:
-        """Run local SGD training on private data and return expert weights."""
+    def train_local(self, general_model: nn.Module = None) -> FedEGSDClientUpdate:
+        """
+        Train expert on private data.
+        If general_model is provided and kd_weight > 0, add KL distillation loss.
+        """
         loader = self.data_module.make_loader(self.dataset, shuffle=True)
-        loss = self._optimize_model(
-            model=self.expert_model,
-            loader=loader,
-            epochs=self.config.federated.local_epochs,
+        kd_weight = float(getattr(self.config.federated, "expert_kd_weight", 0.0))
+        kd_temperature = float(getattr(self.config.federated, "expert_kd_temperature", 3.0))
+
+        use_kd = general_model is not None and kd_weight > 0.0
+
+        if not use_kd:
+            # Pure CE, use base class helper
+            loss = self._optimize_model(
+                model=self.expert_model,
+                loader=loader,
+                epochs=self.config.federated.local_epochs,
+                lr=self.config.federated.local_lr,
+                momentum=self.config.federated.local_momentum,
+                weight_decay=self.config.federated.local_weight_decay,
+            )
+        else:
+            # CE + KD from general model
+            loss = self._train_with_kd(loader, general_model, kd_weight, kd_temperature)
+
+        state = {k: v.detach().cpu().clone() for k, v in self.expert_model.state_dict().items()}
+        return FedEGSDClientUpdate(
+            client_id=self.client_id, num_samples=len(self.dataset),
+            loss=loss, expert_state_dict=state,
+        )
+
+    def _train_with_kd(
+        self,
+        loader: DataLoader,
+        general_model: nn.Module,
+        kd_weight: float,
+        kd_temperature: float,
+    ) -> float:
+        """Train expert with CE + KD from general model on private data."""
+        optimizer = torch.optim.SGD(
+            self.expert_model.parameters(),
             lr=self.config.federated.local_lr,
             momentum=self.config.federated.local_momentum,
             weight_decay=self.config.federated.local_weight_decay,
         )
-        # Clone state dict to CPU for upload
-        state = {
-            k: v.detach().cpu().clone()
-            for k, v in self.expert_model.state_dict().items()
-        }
-        return FedEGSDClientUpdate(
-            client_id=self.client_id,
-            num_samples=len(self.dataset),
-            loss=loss,
-            expert_state_dict=state,
-        )
+        criterion = nn.CrossEntropyLoss()
+
+        self.expert_model.train()
+        general_model.eval()
+
+        total_loss = 0.0
+        total_batches = 0
+
+        for _ in range(self.config.federated.local_epochs):
+            for images, targets, _ in loader:
+                images = images.to(self.device)
+                targets = targets.to(self.device)
+
+                # Teacher forward (no grad)
+                with torch.no_grad():
+                    teacher_logits = general_model(images)
+                    teacher_probs = F.softmax(teacher_logits / kd_temperature, dim=1)
+
+                # Student forward
+                optimizer.zero_grad(set_to_none=True)
+                student_logits = self.expert_model(images)
+
+                # CE loss on true labels
+                ce_loss = criterion(student_logits, targets)
+
+                # KL divergence loss (student learns from general model's soft labels)
+                student_log_probs = F.log_softmax(student_logits / kd_temperature, dim=1)
+                kl_loss = F.kl_div(
+                    student_log_probs, teacher_probs, reduction="batchmean",
+                ) * (kd_temperature ** 2)
+
+                loss = ce_loss + kd_weight * kl_loss
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item()
+                total_batches += 1
+
+        return total_loss / max(total_batches, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -144,46 +247,24 @@ class FedEGSDClient(BaseFederatedClient):
 # ---------------------------------------------------------------------------
 
 class FedEGSDServer(BaseFederatedServer):
-    """
-    Server-side logic for FedEGS-D.
-
-    Each round:
-      1. Sample clients, collect expert weights.
-      2. Instantiate expert replicas, run on proxy dataset → ensemble logits.
-      3. Distill ensemble logits into the general model (KL + CE).
-      4. Evaluate routed / expert-only / general-only.
-    """
 
     def __init__(
-        self,
-        config,
+        self, config,
         client_datasets: Dict[str, Dataset],
         client_test_datasets: Dict[str, Dataset],
-        data_module,
-        test_hard_indices,
-        writer=None,
-        public_dataset: Dataset | None = None,
+        data_module, test_hard_indices,
+        writer=None, public_dataset: Dataset | None = None,
     ) -> None:
-        if public_dataset is None or len(public_dataset) == 0:
-            raise ValueError("FedEGS-D requires a non-empty public_dataset for server-side distillation.")
+        super().__init__(config, client_datasets, client_test_datasets,
+                         data_module, test_hard_indices, writer, public_dataset=public_dataset)
 
-        super().__init__(
-            config,
-            client_datasets,
-            client_test_datasets,
-            data_module,
-            test_hard_indices,
-            writer,
-            public_dataset=public_dataset,
-        )
-
-        # --- General model (server-side, full precision) ---
+        # General model — random init (no pretrain, aligned with FedDF)
         self.general_model = GeneralModel(
             num_classes=config.model.num_classes,
-            pretrained_imagenet=bool(config.federated.general_pretrain_imagenet_init),
+            pretrained_imagenet=bool(getattr(config.federated, "general_pretrain_imagenet_init", False)),
         ).to(self.device)
 
-        # --- Reference expert for FLOPs estimation ---
+        # FLOPs
         self.reference_expert = SmallCNN(
             num_classes=config.model.num_classes,
             base_channels=config.model.expert_base_channels,
@@ -191,507 +272,323 @@ class FedEGSDServer(BaseFederatedServer):
         self.expert_flops = estimate_model_flops(self.reference_expert)
         self.general_flops = estimate_model_flops(self.general_model)
 
-        # --- Clients ---
+        # Clients
         self.clients: Dict[str, FedEGSDClient] = {
-            cid: FedEGSDClient(cid, ds, config.model.num_classes, config.federated.device, config, data_module)
+            cid: FedEGSDClient(cid, ds, config.model.num_classes,
+                               config.federated.device, config, data_module)
             for cid, ds in client_datasets.items()
         }
 
-        # --- Public data loader ---
-        self.public_loader = self.data_module.make_loader(self.public_dataset, shuffle=False)
-
-        # --- Distillation optimiser ---
-        self.distill_optimizer = torch.optim.Adam(
-            self.general_model.parameters(),
-            lr=self.config.federated.distill_lr,
-            weight_decay=self.config.federated.local_weight_decay,
+        # --- External distillation dataset ---
+        distill_name = str(getattr(config.federated, "distill_dataset", "cifar100"))
+        distill_root = str(getattr(config.federated, "distill_dataset_root", config.dataset.root))
+        distill_max = int(getattr(config.federated, "distill_max_samples", 0))
+        self.distill_dataset = load_distillation_dataset(distill_name, distill_root, distill_max)
+        self.distill_loader = DataLoader(
+            self.distill_dataset, batch_size=config.dataset.batch_size,
+            shuffle=False, num_workers=config.dataset.num_workers,
         )
 
-        # --- Tracking ---
+        # Public loader (for routing threshold calibration only)
+        if public_dataset is not None and len(public_dataset) > 0:
+            self.public_loader = self.data_module.make_loader(public_dataset, shuffle=False)
+        else:
+            self.public_loader = None
+
+        # Tracking
         self.last_history: List[RoundMetrics] = []
         self.best_snapshot: Optional[Dict] = None
 
-        # --- Per-client routing thresholds ---
-        base_conf = float(config.inference.confidence_threshold)
-        base_margin = float(config.inference.route_distance_threshold)
-        self.client_confidence_thresholds = {cid: base_conf for cid in client_datasets}
-        self.client_margin_thresholds = {cid: base_margin for cid in client_datasets}
+        # Per-client thresholds
+        bc = float(config.inference.confidence_threshold)
+        bm = float(config.inference.route_distance_threshold)
+        self.client_confidence_thresholds = {c: bc for c in client_datasets}
+        self.client_margin_thresholds = {c: bm for c in client_datasets}
 
-    # ------------------------------------------------------------------
-    # Optional: pretrain general model on public data before federation
-    # ------------------------------------------------------------------
+    # ================================================================
+    # AVGLOGITS extraction (FedDF core)
+    # ================================================================
 
-    def _pretrain_general_on_public(self) -> None:
-        epochs = max(int(self.config.federated.general_pretrain_epochs), 0)
-        if epochs == 0:
-            return
-        lr = float(self.config.federated.general_pretrain_lr)
-        LOGGER.info("fedegsd pretrain general | epochs=%d | lr=%.4f", epochs, lr)
-
-        optimizer = torch.optim.SGD(
-            self.general_model.parameters(), lr=lr, momentum=0.9,
-            weight_decay=float(self.config.federated.local_weight_decay),
-        )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-        criterion = nn.CrossEntropyLoss()
-        shuffle_loader = self.data_module.make_loader(self.public_dataset, shuffle=True)
-
-        best_acc, best_state = -1.0, None
-        for epoch in range(1, epochs + 1):
-            self.general_model.train()
-            correct = total = 0
-            for images, targets, _ in shuffle_loader:
-                images, targets = images.to(self.device), targets.to(self.device)
-                optimizer.zero_grad(set_to_none=True)
-                loss = criterion(self.general_model(images), targets)
-                loss.backward()
-                optimizer.step()
-                correct += int((self.general_model(images).argmax(1) == targets).sum())
-                total += targets.size(0)
-            scheduler.step()
-            acc = correct / max(total, 1)
-            LOGGER.info("fedegsd pretrain epoch %d/%d | acc=%.4f", epoch, epochs, acc)
-            if acc > best_acc:
-                best_acc = acc
-                best_state = {k: v.cpu().clone() for k, v in self.general_model.state_dict().items()}
-
-        if best_state is not None:
-            self.general_model.load_state_dict(best_state)
-            LOGGER.info("fedegsd pretrain done | best_acc=%.4f", best_acc)
-
-        # Reset distill optimizer
-        self.distill_optimizer = torch.optim.Adam(
-            self.general_model.parameters(),
-            lr=self.config.federated.distill_lr,
-            weight_decay=self.config.federated.local_weight_decay,
-        )
-
-    # ------------------------------------------------------------------
-    # Server-side ensemble logit extraction  (FedDF core)
-    # ------------------------------------------------------------------
-
-    def _extract_ensemble_logits(
-        self,
-        updates: List[FedEGSDClientUpdate],
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Instantiate each client's expert model on the server, run on the
-        public dataset, and produce per-sample averaged soft-labels.
-
-        Returns dict with keys:
-          - 'soft_labels': Tensor [N_public, num_classes]
-          - 'entropy_weights': Tensor [N_public]  (higher = more certain)
-        """
+    def _extract_ensemble_logits(self, updates: List[FedEGSDClientUpdate]) -> Dict[str, torch.Tensor]:
+        """Average raw logits across experts, THEN softmax (FedDF AVGLOGITS)."""
         num_classes = self.config.model.num_classes
         temperature = float(self.config.federated.distill_temperature)
 
-        # Collect per-client logits
-        all_client_probs: List[torch.Tensor] = []
-        all_client_entropy: List[torch.Tensor] = []
+        all_logits: List[torch.Tensor] = []
+        all_weights: List[torch.Tensor] = []
 
         for update in updates:
-            expert = SmallCNN(
-                num_classes=num_classes,
-                base_channels=self.config.model.expert_base_channels,
-            ).to(self.device)
+            expert = SmallCNN(num_classes=num_classes,
+                              base_channels=self.config.model.expert_base_channels).to(self.device)
             expert.load_state_dict(update.expert_state_dict)
             expert.eval()
 
-            sample_probs_list: List[torch.Tensor] = []
+            batches: List[torch.Tensor] = []
             with torch.no_grad():
-                for images, _, _ in self.public_loader:
-                    images = images.to(self.device)
-                    logits = expert(images)
-                    probs = F.softmax(logits / temperature, dim=1)
-                    sample_probs_list.append(probs.cpu())
+                for batch in self.distill_loader:
+                    images = batch[0].to(self.device)
+                    batches.append(expert(images).cpu())
 
-            client_probs = torch.cat(sample_probs_list, dim=0)  # [N, C]
-            # Entropy for uncertainty weighting
-            log_num_classes = math.log(float(num_classes))
-            entropy = -(client_probs * client_probs.clamp_min(1e-8).log()).sum(dim=1) / max(log_num_classes, 1e-8)
-            weights = torch.exp(-entropy)  # low entropy → high weight
+            client_logits = torch.cat(batches, dim=0)  # [N, C]
 
-            all_client_probs.append(client_probs)
-            all_client_entropy.append(weights)
+            # Entropy-based uncertainty weight
+            probs = F.softmax(client_logits / temperature, dim=1)
+            log_C = math.log(float(num_classes))
+            ent = -(probs * probs.clamp_min(1e-8).log()).sum(1) / max(log_C, 1e-8)
+            w = torch.exp(-ent)
 
-            del expert  # free GPU memory
+            all_logits.append(client_logits)
+            all_weights.append(w)
+            del expert
 
-        # Uncertainty-weighted averaging across clients
-        stacked_probs = torch.stack(all_client_probs, dim=0)      # [K, N, C]
-        stacked_weights = torch.stack(all_client_entropy, dim=0)   # [K, N]
+        stacked_l = torch.stack(all_logits, dim=0)   # [K, N, C]
+        stacked_w = torch.stack(all_weights, dim=0)   # [K, N]
 
-        # Per-sample per-client weight
-        weight_sum = stacked_weights.sum(dim=0, keepdim=True).clamp_min(1e-8)  # [1, N]
-        normalised_weights = stacked_weights / weight_sum  # [K, N]
+        norm_w = stacked_w / stacked_w.sum(0, keepdim=True).clamp_min(1e-8)  # [K, N]
+        avg_logits = (stacked_l * norm_w.unsqueeze(-1)).sum(0)                # [N, C]
+        soft_labels = F.softmax(avg_logits / temperature, dim=1)
+        sample_w = stacked_w.mean(0)
 
-        # Weighted average: [K, N, C] * [K, N, 1] → sum over K → [N, C]
-        soft_labels = (stacked_probs * normalised_weights.unsqueeze(-1)).sum(dim=0)
-        # Re-normalise
-        soft_labels = soft_labels / soft_labels.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        return {"soft_labels": soft_labels, "sample_weights": sample_w}
 
-        # Overall certainty per sample (mean weight across clients)
-        sample_certainty = stacked_weights.mean(dim=0)
+    # ================================================================
+    # Distillation: pure KL + Adam + cosine annealing
+    # ================================================================
 
-        return {
-            "soft_labels": soft_labels,
-            "entropy_weights": sample_certainty,
-        }
-
-    # ------------------------------------------------------------------
-    # Server-side distillation of general model
-    # ------------------------------------------------------------------
-
-    def _distill_general_model(
-        self,
-        ensemble: Dict[str, torch.Tensor],
-        round_idx: int,
-    ) -> Dict[str, float]:
-        """Distill ensemble soft-labels into the general model."""
+    def _distill_general_model(self, ensemble: Dict[str, torch.Tensor], round_idx: int) -> Dict[str, float]:
         temperature = float(self.config.federated.distill_temperature)
         distill_epochs = max(int(self.config.federated.distill_epochs), 1)
+        bs = self.config.dataset.batch_size
 
-        soft_labels_all = ensemble["soft_labels"]       # [N, C]
-        weights_all = ensemble["entropy_weights"]       # [N]
+        soft_all = ensemble["soft_labels"]
+        w_all = ensemble["sample_weights"]
 
-        # Build index mapping for the public loader
-        # The public loader yields (images, targets, indices) in the same order
-        # as soft_labels_all because the loader is not shuffled.
-        criterion_ce = nn.CrossEntropyLoss()
+        # Collect distillation images (same order as soft_all)
+        all_imgs: List[torch.Tensor] = []
+        for batch in self.distill_loader:
+            all_imgs.append(batch[0])
+        distill_images = torch.cat(all_imgs, dim=0)
+        N = distill_images.size(0)
+
+        # Fresh optimizer + cosine schedule per round
+        optimizer = torch.optim.Adam(self.general_model.parameters(),
+                                     lr=float(self.config.federated.distill_lr))
+        total_steps = distill_epochs * ((N + bs - 1) // bs)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(total_steps, 1))
 
         self.general_model.train()
         total_loss = 0.0
-        total_kl = 0.0
-        total_ce = 0.0
         total_batches = 0
-        offset = 0
 
         for _ in range(distill_epochs):
-            offset = 0
-            for images, targets, _ in self.public_loader:
-                bs = images.size(0)
-                images = images.to(self.device)
-                targets = targets.to(self.device)
+            perm = torch.randperm(N)
+            for start in range(0, N, bs):
+                idx = perm[start:start + bs]
+                imgs = distill_images[idx].to(self.device)
+                b_soft = soft_all[idx].to(self.device)
+                b_w = w_all[idx].to(self.device)
 
-                batch_soft = soft_labels_all[offset:offset + bs].to(self.device)
-                batch_weights = weights_all[offset:offset + bs].to(self.device)
-                offset += bs
+                optimizer.zero_grad(set_to_none=True)
+                s_logits = self.general_model(imgs)
 
-                self.distill_optimizer.zero_grad(set_to_none=True)
-                student_logits = self.general_model(images)
+                s_log_p = F.log_softmax(s_logits / temperature, dim=1)
+                per_kl = F.kl_div(s_log_p, b_soft, reduction="none").sum(1) * (temperature ** 2)
+                loss = (per_kl * b_w).sum() / b_w.sum().clamp_min(1e-8)
 
-                # CE on true labels
-                ce_loss = criterion_ce(student_logits, targets)
-
-                # KL on soft labels (weighted)
-                student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
-                per_sample_kl = F.kl_div(
-                    student_log_probs, batch_soft, reduction="none",
-                ).sum(dim=1) * (temperature ** 2)
-                kl_loss = (per_sample_kl * batch_weights).sum() / batch_weights.sum().clamp_min(1e-8)
-
-                loss = ce_loss + float(self.config.federated.logit_align_weight) * kl_loss
                 loss.backward()
-                self.distill_optimizer.step()
+                optimizer.step()
+                scheduler.step()
 
                 total_loss += loss.item()
-                total_ce += ce_loss.item()
-                total_kl += kl_loss.item()
                 total_batches += 1
 
-        denom = max(total_batches, 1)
-        return {
-            "total_loss": total_loss / denom,
-            "ce_loss": total_ce / denom,
-            "kl_loss": total_kl / denom,
-        }
+        d = max(total_batches, 1)
+        return {"total_loss": total_loss / d, "kl_loss": total_loss / d}
 
-    # ------------------------------------------------------------------
-    # Predictors for evaluation
-    # ------------------------------------------------------------------
+    # ================================================================
+    # Predictors
+    # ================================================================
 
     def _predict_general_only(self, client_id, images, indices):
         self.general_model.eval()
-        return self.general_model(images).argmax(dim=1), 0
+        return self.general_model(images).argmax(1), 0
 
     def _predict_expert_only(self, client_id, images, indices):
         self.clients[client_id].expert_model.eval()
-        return self.clients[client_id].expert_model(images).argmax(dim=1), 0
+        return self.clients[client_id].expert_model(images).argmax(1), 0
 
     def _predict_routed(self, client_id, images, indices):
         return self._confidence_route(
-            self.clients[client_id].expert_model,
-            self.general_model,
-            images,
+            self.clients[client_id].expert_model, self.general_model, images,
             confidence_threshold=self.client_confidence_thresholds[client_id],
             margin_threshold=self.client_margin_thresholds[client_id],
         )
 
-    # ------------------------------------------------------------------
-    # Adaptive routing threshold update
-    # ------------------------------------------------------------------
+    # ================================================================
+    # Routing threshold adaptation
+    # ================================================================
 
-    def _update_routing_thresholds(self, updates: List[FedEGSDClientUpdate]) -> None:
+    def _update_routing_thresholds(self, updates):
+        if self.public_loader is None:
+            return
         step = max(float(self.config.inference.personalized_threshold_step), 0.0)
-        margin_step = max(float(self.config.inference.personalized_margin_step), 0.0)
-        teacher_gap_guard = float(self.config.inference.public_teacher_gap_guard)
-        min_conf = float(self.config.inference.min_confidence_threshold)
-        max_conf = float(self.config.inference.max_confidence_threshold)
-        min_margin = float(self.config.inference.min_margin_threshold)
-        max_margin = float(self.config.inference.max_margin_threshold)
+        mstep = max(float(self.config.inference.personalized_margin_step), 0.0)
+        guard = float(self.config.inference.public_teacher_gap_guard)
+        gp = self._predict_public_general()
+        pt = self._get_public_targets()
 
-        # General model predictions on public data
-        general_preds = self._predict_public_general_labels()
-        public_targets = self._build_public_target_lookup()
-
-        for update in updates:
-            cid = update.client_id
-            threshold = self.client_confidence_thresholds[cid]
-            margin = self.client_margin_thresholds[cid]
-
-            # Expert accuracy on public data (via uploaded weights)
-            expert = SmallCNN(
-                num_classes=self.config.model.num_classes,
-                base_channels=self.config.model.expert_base_channels,
-            ).to(self.device)
-            expert.load_state_dict(update.expert_state_dict)
-            expert.eval()
-
-            expert_correct = 0
-            general_correct = 0
-            total = 0
+        for u in updates:
+            cid = u.client_id
+            thr = self.client_confidence_thresholds[cid]
+            mar = self.client_margin_thresholds[cid]
+            expert = SmallCNN(num_classes=self.config.model.num_classes,
+                              base_channels=self.config.model.expert_base_channels).to(self.device)
+            expert.load_state_dict(u.expert_state_dict); expert.eval()
+            eo = go = tot = 0
             with torch.no_grad():
-                for images, targets, indices in self.public_loader:
-                    images = images.to(self.device)
-                    ep = expert(images).argmax(1).cpu()
-                    for i, idx in enumerate(indices.tolist()):
-                        t = public_targets[idx]
-                        expert_correct += int(ep[i].item() == t)
-                        general_correct += int(general_preds[idx] == t)
-                        total += 1
-
-            expert_acc = expert_correct / max(total, 1)
-            general_acc = general_correct / max(total, 1)
-            teacher_gap = general_acc - expert_acc
-
-            if teacher_gap > teacher_gap_guard:
-                threshold += step
-                margin += margin_step
-            elif teacher_gap < -teacher_gap_guard:
-                threshold -= step
-                margin -= margin_step
-
-            self.client_confidence_thresholds[cid] = min(max(threshold, min_conf), max_conf)
-            self.client_margin_thresholds[cid] = min(max(margin, min_margin), max_margin)
+                for imgs, _, idxs in self.public_loader:
+                    imgs = imgs.to(self.device)
+                    ep = expert(imgs).argmax(1).cpu()
+                    for i, idx in enumerate(idxs.tolist()):
+                        t = pt[idx]; eo += int(ep[i].item() == t); go += int(gp[idx] == t); tot += 1
+            gap = (go - eo) / max(tot, 1)
+            if gap > guard: thr += step; mar += mstep
+            elif gap < -guard: thr -= step; mar -= mstep
+            self.client_confidence_thresholds[cid] = min(max(thr, float(self.config.inference.min_confidence_threshold)),
+                                                         float(self.config.inference.max_confidence_threshold))
+            self.client_margin_thresholds[cid] = min(max(mar, float(self.config.inference.min_margin_threshold)),
+                                                     float(self.config.inference.max_margin_threshold))
             del expert
 
-    def _predict_public_general_labels(self) -> Dict[int, int]:
-        preds: Dict[int, int] = {}
-        self.general_model.eval()
+    def _predict_public_general(self):
+        p = {}; self.general_model.eval()
         with torch.no_grad():
-            for images, _, indices in self.public_loader:
-                images = images.to(self.device)
-                p = self.general_model(images).argmax(1).cpu().tolist()
-                for idx, pred in zip(indices.tolist(), p):
-                    preds[idx] = pred
-        return preds
+            for imgs, _, idxs in self.public_loader:
+                imgs = imgs.to(self.device)
+                for idx, pred in zip(idxs.tolist(), self.general_model(imgs).argmax(1).cpu().tolist()):
+                    p[idx] = pred
+        return p
 
-    def _build_public_target_lookup(self) -> Dict[int, int]:
-        targets: Dict[int, int] = {}
-        for _, t, indices in self.public_loader:
-            for idx, target in zip(indices.tolist(), t.tolist()):
-                targets[idx] = target
-        return targets
+    def _get_public_targets(self):
+        t = {}
+        for _, targets, idxs in self.public_loader:
+            for idx, target in zip(idxs.tolist(), targets.tolist()):
+                t[idx] = target
+        return t
 
-    # ------------------------------------------------------------------
-    # Snapshot management
-    # ------------------------------------------------------------------
+    # ================================================================
+    # Snapshots
+    # ================================================================
 
-    def _maybe_update_best_snapshot(
-        self, round_idx: int, round_metrics: RoundMetrics,
-        expert_acc: float, general_acc: float,
-    ) -> bool:
-        if self.best_snapshot is None:
-            is_better = True
-        else:
-            is_better = round_metrics.routed_accuracy > float(self.best_snapshot["routed_accuracy"]) + 1e-8
-        if not is_better:
-            return False
-
+    def _maybe_update_best(self, ri, rm, ea, ga):
+        better = self.best_snapshot is None or rm.routed_accuracy > float(self.best_snapshot["routed_accuracy"]) + 1e-8
+        if not better: return False
         self.best_snapshot = {
-            "round_idx": round_idx,
-            "routed_accuracy": round_metrics.routed_accuracy,
-            "general_accuracy": general_acc,
-            "expert_accuracy": expert_acc,
-            "avg_client_loss": round_metrics.avg_client_loss,
+            "round_idx": ri, "routed_accuracy": rm.routed_accuracy,
+            "general_accuracy": ga, "expert_accuracy": ea,
+            "avg_client_loss": rm.avg_client_loss,
             "general_model_state": {k: v.cpu().clone() for k, v in self.general_model.state_dict().items()},
-            "client_expert_states": {
-                cid: {k: v.cpu().clone() for k, v in c.expert_model.state_dict().items()}
-                for cid, c in self.clients.items()
-            },
+            "client_expert_states": {c: {k: v.cpu().clone() for k, v in cl.expert_model.state_dict().items()} for c, cl in self.clients.items()},
             "client_confidence_thresholds": dict(self.client_confidence_thresholds),
             "client_margin_thresholds": dict(self.client_margin_thresholds),
         }
-        LOGGER.info(
-            "fedegsd best snapshot | round=%d | routed=%.4f | general=%.4f | expert=%.4f",
-            round_idx, round_metrics.routed_accuracy, general_acc, expert_acc,
-        )
+        LOGGER.info("fedegsd best | round=%d | routed=%.4f | general=%.4f | expert=%.4f", ri, rm.routed_accuracy, ga, ea)
         return True
 
-    def _restore_best_snapshot(self) -> None:
-        if self.best_snapshot is None:
-            return
+    def _restore_best(self):
+        if not self.best_snapshot: return
         self.general_model.load_state_dict(self.best_snapshot["general_model_state"])
-        for cid, state in self.best_snapshot["client_expert_states"].items():
-            self.clients[cid].expert_model.load_state_dict(state)
+        for c, st in self.best_snapshot["client_expert_states"].items():
+            self.clients[c].expert_model.load_state_dict(st)
         self.client_confidence_thresholds = dict(self.best_snapshot["client_confidence_thresholds"])
         self.client_margin_thresholds = dict(self.best_snapshot["client_margin_thresholds"])
-        LOGGER.info("fedegsd restored best snapshot from round %d", self.best_snapshot["round_idx"])
+        LOGGER.info("fedegsd restored best from round %d", self.best_snapshot["round_idx"])
 
-    # ------------------------------------------------------------------
-    # Main training loop
-    # ------------------------------------------------------------------
+    # ================================================================
+    # Main loop
+    # ================================================================
 
     def train(self, test_dataset: Dataset) -> List[RoundMetrics]:
-        # Optional pretrain
-        if bool(self.config.federated.general_pretrain_on_public):
-            self._pretrain_general_on_public()
-
         metrics: List[RoundMetrics] = []
-        for round_idx in range(1, self.config.federated.rounds + 1):
-            # 1. Sample clients
-            sampled_ids = self._sample_client_ids()
-            LOGGER.info("fedegsd round %d | clients=%s", round_idx, sampled_ids)
+        kd_warmup = int(getattr(self.config.federated, "expert_kd_warmup_rounds", 10))
 
-            # 2. Local expert training → upload weights
-            updates: List[FedEGSDClientUpdate] = []
-            for cid in sampled_ids:
-                updates.append(self.clients[cid].train_local())
+        for ri in range(1, self.config.federated.rounds + 1):
+            sids = self._sample_client_ids()
 
-            # 3. Server-side: extract ensemble logits from uploaded experts
+            # KD warmup: first N rounds train expert with pure CE (no KD from random general)
+            # After warmup, general model has accumulated enough quality to be a useful teacher
+            use_kd = ri > kd_warmup
+            teacher = self.general_model if use_kd else None
+            if ri == kd_warmup + 1:
+                LOGGER.info("fedegsd round %d | KD warmup complete, enabling expert KD from general model", ri)
+
+            LOGGER.info("fedegsd round %d | clients=%s | kd=%s", ri, sids, use_kd)
+
+            updates = [self.clients[c].train_local(general_model=teacher) for c in sids]
             ensemble = self._extract_ensemble_logits(updates)
-
-            # 4. Server-side: distill into general model
-            distill_stats = self._distill_general_model(ensemble, round_idx)
-
-            # 5. Update routing thresholds
+            ds = self._distill_general_model(ensemble, ri)
             self._update_routing_thresholds(updates)
 
-            # 6. Evaluate
-            expert_eval = self._evaluate_predictor_on_client_tests(self._predict_expert_only, prefix="fedegsd-expert")
-            general_eval = self._evaluate_predictor_on_client_tests(self._predict_general_only, prefix="fedegsd-general")
-            routed_eval = self._evaluate_predictor_on_client_tests(self._predict_routed, prefix="fedegsd-routed")
+            ee = self._evaluate_predictor_on_client_tests(self._predict_expert_only, "fedegsd-expert")
+            ge = self._evaluate_predictor_on_client_tests(self._predict_general_only, "fedegsd-general")
+            re = self._evaluate_predictor_on_client_tests(self._predict_routed, "fedegsd-routed")
 
-            avg_loss = sum(u.loss for u in updates) / max(len(updates), 1)
-            agg = routed_eval["aggregate"]
-            macro = routed_eval["macro"]
-            compute_profile = self._build_compute_profile(
-                self.expert_flops, self.general_flops, agg["invocation_rate"], mode="routed",
-            )
+            al = sum(u.loss for u in updates) / max(len(updates), 1)
+            a = re["aggregate"]; m = re["macro"]
+            cp = self._build_compute_profile(self.expert_flops, self.general_flops, a["invocation_rate"], "routed")
 
-            round_metrics = RoundMetrics(
-                round_idx=round_idx,
-                avg_client_loss=avg_loss,
-                routed_accuracy=agg["accuracy"],
-                hard_accuracy=agg["hard_recall"],
-                invocation_rate=agg["invocation_rate"],
-                local_accuracy=macro["accuracy"],
-                compute_savings=compute_profile["savings_ratio"],
-            )
+            rm = RoundMetrics(round_idx=ri, avg_client_loss=al, routed_accuracy=a["accuracy"],
+                              hard_accuracy=a["hard_recall"], invocation_rate=a["invocation_rate"],
+                              local_accuracy=m["accuracy"], compute_savings=cp["savings_ratio"])
 
-            LOGGER.info(
-                "fedegsd round %d | loss=%.4f | distill=%.4f | routed=%.4f | expert=%.4f | general=%.4f | hard=%.4f | invoke=%.4f | savings=%.4f",
-                round_idx, avg_loss, distill_stats["total_loss"],
-                agg["accuracy"], expert_eval["aggregate"]["accuracy"],
-                general_eval["aggregate"]["accuracy"], agg["hard_recall"],
-                agg["invocation_rate"], compute_profile["savings_ratio"],
-            )
+            LOGGER.info("fedegsd round %d | loss=%.4f | distill=%.4f | routed=%.4f | expert=%.4f | general=%.4f | hard=%.4f | invoke=%.4f",
+                         ri, al, ds["total_loss"], a["accuracy"], ee["aggregate"]["accuracy"],
+                         ge["aggregate"]["accuracy"], a["hard_recall"], a["invocation_rate"])
 
-            if self.writer is not None:
-                self.writer.add_scalar("expert_loss/fedegsd", avg_loss, round_idx)
-                self.writer.add_scalar("distill_loss/fedegsd", distill_stats["total_loss"], round_idx)
-                self.writer.add_scalar("distill_ce/fedegsd", distill_stats["ce_loss"], round_idx)
-                self.writer.add_scalar("distill_kl/fedegsd", distill_stats["kl_loss"], round_idx)
-                self._log_auxiliary_accuracy_metrics(
-                    "fedegsd", round_idx,
-                    expert_eval["aggregate"]["accuracy"],
-                    general_eval["aggregate"]["accuracy"],
-                )
+            if self.writer:
+                self.writer.add_scalar("expert_loss/fedegsd", al, ri)
+                self.writer.add_scalar("distill_loss/fedegsd", ds["total_loss"], ri)
+                self._log_auxiliary_accuracy_metrics("fedegsd", ri, ee["aggregate"]["accuracy"], ge["aggregate"]["accuracy"])
 
-            self._log_round_metrics("fedegsd", round_metrics)
-            metrics.append(round_metrics)
-
-            self._maybe_update_best_snapshot(
-                round_idx, round_metrics,
-                expert_eval["aggregate"]["accuracy"],
-                general_eval["aggregate"]["accuracy"],
-            )
+            self._log_round_metrics("fedegsd", rm)
+            metrics.append(rm)
+            self._maybe_update_best(ri, rm, ee["aggregate"]["accuracy"], ge["aggregate"]["accuracy"])
 
         self.last_history = metrics
         if self.config.federated.restore_best_checkpoint:
-            self._restore_best_snapshot()
+            self._restore_best()
         return metrics
 
-    # ------------------------------------------------------------------
-    # Final evaluation
-    # ------------------------------------------------------------------
+    # ================================================================
+    # Final eval
+    # ================================================================
 
-    def evaluate_baselines(self, test_dataset: Dataset):
-        route_path = self._build_route_export_path("fedegsd_final_routed")
-        routed = self._evaluate_predictor_on_client_tests(self._predict_routed, "fedegsd_final_routed", route_export_path=route_path)
-        expert = self._evaluate_predictor_on_client_tests(self._predict_expert_only, "fedegsd_final_expert")
-        general = self._evaluate_predictor_on_client_tests(self._predict_general_only, "fedegsd_final_general")
-
-        final_loss = self.last_history[-1].avg_client_loss if self.last_history else 0.0
-        best_round = 0
-        if self.best_snapshot:
-            final_loss = float(self.best_snapshot["avg_client_loss"])
-            best_round = int(self.best_snapshot["round_idx"])
-
-        routed_compute = self._build_compute_profile(self.expert_flops, self.general_flops, routed["aggregate"]["invocation_rate"], "routed")
-        expert_compute = self._build_compute_profile(self.expert_flops, self.general_flops, 0.0, "expert_only")
-        general_compute = self._build_compute_profile(self.expert_flops, self.general_flops, 1.0, "general_only")
-
+    def evaluate_baselines(self, test_dataset):
+        rp = self._build_route_export_path("fedegsd_final_routed")
+        ro = self._evaluate_predictor_on_client_tests(self._predict_routed, "fedegsd_final_routed", route_export_path=rp)
+        eo = self._evaluate_predictor_on_client_tests(self._predict_expert_only, "fedegsd_final_expert")
+        go = self._evaluate_predictor_on_client_tests(self._predict_general_only, "fedegsd_final_general")
+        fl = self.last_history[-1].avg_client_loss if self.last_history else 0.0
+        br = 0
+        if self.best_snapshot: fl = float(self.best_snapshot["avg_client_loss"]); br = int(self.best_snapshot["round_idx"])
+        rc = self._build_compute_profile(self.expert_flops, self.general_flops, ro["aggregate"]["invocation_rate"], "routed")
+        ec = self._build_compute_profile(self.expert_flops, self.general_flops, 0.0, "expert_only")
+        gc = self._build_compute_profile(self.expert_flops, self.general_flops, 1.0, "general_only")
         return {
             "algorithm": "fedegsd",
             "metrics": {
-                "accuracy": routed["aggregate"]["accuracy"],
-                "global_accuracy": routed["aggregate"]["accuracy"],
-                "local_accuracy": routed["macro"]["accuracy"],
-                "routed_accuracy": routed["aggregate"]["accuracy"],
-                "hard_accuracy": routed["aggregate"]["hard_recall"],
-                "hard_sample_recall": routed["aggregate"]["hard_recall"],
-                "routed_hard_accuracy": routed["aggregate"]["hard_recall"],
-                "general_invocation_rate": routed["aggregate"]["invocation_rate"],
-                "compute_savings": routed_compute["savings_ratio"],
-                "precision_macro": routed["aggregate"]["precision_macro"],
-                "recall_macro": routed["aggregate"]["recall_macro"],
-                "f1_macro": routed["aggregate"]["f1_macro"],
-                "expert_only_accuracy": expert["aggregate"]["accuracy"],
-                "general_only_accuracy": general["aggregate"]["accuracy"],
-                "public_dataset_size": len(self.public_dataset),
-                "final_training_loss": final_loss,
-                "best_round": best_round,
+                "accuracy": ro["aggregate"]["accuracy"], "global_accuracy": ro["aggregate"]["accuracy"],
+                "local_accuracy": ro["macro"]["accuracy"], "routed_accuracy": ro["aggregate"]["accuracy"],
+                "hard_accuracy": ro["aggregate"]["hard_recall"], "hard_sample_recall": ro["aggregate"]["hard_recall"],
+                "general_invocation_rate": ro["aggregate"]["invocation_rate"], "compute_savings": rc["savings_ratio"],
+                "precision_macro": ro["aggregate"]["precision_macro"], "recall_macro": ro["aggregate"]["recall_macro"],
+                "f1_macro": ro["aggregate"]["f1_macro"],
+                "expert_only_accuracy": eo["aggregate"]["accuracy"], "general_only_accuracy": go["aggregate"]["accuracy"],
+                "final_training_loss": fl, "best_round": br,
             },
-            "client_metrics": {
-                "routed": routed["clients"],
-                "expert_only": expert["clients"],
-                "general_only": general["clients"],
-            },
-            "group_metrics": {
-                "routed": routed["groups"],
-                "expert_only": expert["groups"],
-                "general_only": general["groups"],
-            },
-            "compute": {
-                "routed": routed_compute,
-                "expert_only": expert_compute,
-                "general_only": general_compute,
-            },
-            "memory_mb": {
-                "expert": model_memory_mb(self.reference_expert),
-                "general": model_memory_mb(self.general_model),
-            },
-            "artifacts": {
-                "route_csv": str(route_path),
-            },
+            "client_metrics": {"routed": ro["clients"], "expert_only": eo["clients"], "general_only": go["clients"]},
+            "group_metrics": {"routed": ro["groups"], "expert_only": eo["groups"], "general_only": go["groups"]},
+            "compute": {"routed": rc, "expert_only": ec, "general_only": gc},
+            "memory_mb": {"expert": model_memory_mb(self.reference_expert), "general": model_memory_mb(self.general_model)},
+            "artifacts": {"route_csv": str(rp)},
         }
