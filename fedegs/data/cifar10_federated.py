@@ -61,24 +61,52 @@ class CIFAR10FederatedDataModule:
     def build(self) -> Dict[str, object]:
         self.prepare()
         train_raw = datasets.CIFAR10(root=self.config.root, train=True, transform=self.train_transform, download=False)
-        train_scoring = datasets.CIFAR10(root=self.config.root, train=True, transform=self.scoring_transform, download=False)
         test_raw = datasets.CIFAR10(root=self.config.root, train=False, transform=self.eval_transform, download=False)
-        test_scoring = datasets.CIFAR10(root=self.config.root, train=False, transform=self.scoring_transform, download=False)
         public_raw = datasets.CIFAR10(root=self.config.root, train=True, transform=self.eval_transform, download=False)
 
         public_indices = self._load_or_build_public_indices(total_samples=len(train_raw), labels=public_raw.targets)
         public_index_set = set(public_indices)
 
-        train_hard_indices, train_easy_indices = self._load_or_build_difficulty_split(train_scoring, split_name="train")
-        test_hard_indices, test_easy_indices = self._load_or_build_difficulty_split(test_scoring, split_name="test")
-        if public_index_set:
-            train_hard_indices = [idx for idx in train_hard_indices if idx not in public_index_set]
-            train_easy_indices = [idx for idx in train_easy_indices if idx not in public_index_set]
+        strategy = self.config.partition_strategy.lower()
 
-        client_train_indices = self._load_or_build_client_partitions(train_hard_indices, train_easy_indices, split_name="train")
-        client_test_indices = self._load_or_build_client_partitions(test_hard_indices, test_easy_indices, split_name="test")
+        if strategy in ("dirichlet", "dir"):
+            client_train_indices = self._build_dirichlet_partition(
+                labels=train_raw.targets, exclude=public_index_set, split_name="train",
+            )
+            client_test_indices = self._build_dirichlet_partition(
+                labels=test_raw.targets, exclude=set(), split_name="test",
+            )
+            # No difficulty scoring needed — hard/easy not used for partitioning
+            train_hard_indices: List[int] = []
+            train_easy_indices: List[int] = list(range(len(train_raw)))
+            test_hard_indices: List[int] = []
+            test_easy_indices: List[int] = list(range(len(test_raw)))
+        elif strategy in ("longtail", "long_tail"):
+            client_train_indices = self._build_longtail_partition(
+                labels=train_raw.targets, exclude=public_index_set, split_name="train",
+            )
+            client_test_indices = self._build_longtail_partition(
+                labels=test_raw.targets, exclude=set(), split_name="test",
+            )
+            train_hard_indices = []
+            train_easy_indices = list(range(len(train_raw)))
+            test_hard_indices = []
+            test_easy_indices = list(range(len(test_raw)))
+        else:
+            # Original difficulty_skewed partition — needs teacher checkpoint
+            train_scoring = datasets.CIFAR10(root=self.config.root, train=True, transform=self.scoring_transform, download=False)
+            test_scoring = datasets.CIFAR10(root=self.config.root, train=False, transform=self.scoring_transform, download=False)
+            train_hard_indices, train_easy_indices = self._load_or_build_difficulty_split(train_scoring, split_name="train")
+            test_hard_indices, test_easy_indices = self._load_or_build_difficulty_split(test_scoring, split_name="test")
+            if public_index_set:
+                train_hard_indices = [idx for idx in train_hard_indices if idx not in public_index_set]
+                train_easy_indices = [idx for idx in train_easy_indices if idx not in public_index_set]
+            client_train_indices = self._load_or_build_client_partitions(train_hard_indices, train_easy_indices, split_name="train")
+            client_test_indices = self._load_or_build_client_partitions(test_hard_indices, test_easy_indices, split_name="test")
+
         self._log_partition_summary(client_train_indices, train_hard_indices, split_name="train")
         self._log_partition_summary(client_test_indices, test_hard_indices, split_name="test")
+        self._log_class_distribution(client_train_indices, train_raw.targets, split_name="train")
 
         indexed_train = IndexedDataset(train_raw)
         indexed_test = IndexedDataset(test_raw)
@@ -420,6 +448,182 @@ class CIFAR10FederatedDataModule:
                 easy_count,
                 hard_count,
             )
+
+    def _log_class_distribution(self, partitions: Dict[str, List[int]], labels: Sequence[int], split_name: str) -> None:
+        """Log per-client class distribution for debugging partition quality."""
+        for client_id, indices in sorted(partitions.items()):
+            class_counts: Dict[int, int] = defaultdict(int)
+            for idx in indices:
+                class_counts[labels[idx]] += 1
+            classes_present = sorted(class_counts.keys())
+            dist_str = " ".join(f"{c}:{class_counts[c]}" for c in classes_present)
+            LOGGER.info("%s client %s | classes=%d/%d | %s",
+                        split_name, client_id, len(classes_present), 10, dist_str)
+
+    def _build_dirichlet_partition(
+        self,
+        labels: Sequence[int],
+        exclude: set,
+        split_name: str,
+    ) -> Dict[str, List[int]]:
+        """
+        Dirichlet distribution partition (Hsu et al., FedDF).
+        alpha controls non-IID degree:
+          alpha → 0: each client gets only 1 class
+          alpha → ∞: uniform IID distribution
+          alpha = 0.1: strongly non-IID (typical for FL experiments)
+          alpha = 0.5: moderately non-IID
+        """
+        import numpy as np
+
+        alpha = float(self.config.dirichlet_alpha)
+        num_clients = self.config.num_clients
+        num_classes = 10  # CIFAR-10
+
+        cache_path = Path(self.config.cache_dir) / f"dirichlet_{split_name}_a{alpha}_c{num_clients}_s{self.seed}.json"
+        if cache_path.exists():
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            LOGGER.info("Loaded cached dirichlet %s partition from %s", split_name, cache_path)
+            return {k: list(v) for k, v in payload["partitions"].items()}
+
+        rng = np.random.RandomState(self.seed)
+
+        # Group indices by class, excluding public set
+        class_indices: Dict[int, List[int]] = defaultdict(list)
+        for idx, label in enumerate(labels):
+            if idx not in exclude:
+                class_indices[label].append(idx)
+
+        # Sample Dirichlet proportions for each class
+        client_indices: Dict[str, List[int]] = {f"client_{i:02d}": [] for i in range(num_clients)}
+        client_names = sorted(client_indices.keys())
+
+        for cls in range(num_classes):
+            indices = class_indices[cls]
+            rng.shuffle(indices)
+
+            # Dirichlet distribution: how to split this class across clients
+            proportions = rng.dirichlet([alpha] * num_clients)
+            # Convert proportions to sample counts
+            proportions = proportions / proportions.sum()
+            counts = (proportions * len(indices)).astype(int)
+            # Distribute remainder
+            remainder = len(indices) - counts.sum()
+            for r in range(remainder):
+                counts[r % num_clients] += 1
+
+            cursor = 0
+            for i, name in enumerate(client_names):
+                client_indices[name].extend(indices[cursor:cursor + counts[i]])
+                cursor += counts[i]
+
+        # Shuffle within each client
+        py_rng = random.Random(self.seed)
+        for name in client_names:
+            py_rng.shuffle(client_indices[name])
+
+        # Remove empty clients if any
+        client_indices = {k: v for k, v in client_indices.items() if len(v) > 0}
+
+        # Cache
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps({"partitions": client_indices}, indent=2), encoding="utf-8")
+        LOGGER.info("Saved dirichlet %s partition to %s | alpha=%.2f", split_name, cache_path, alpha)
+        return client_indices
+
+    def _build_longtail_partition(
+        self,
+        labels: Sequence[int],
+        exclude: set,
+        split_name: str,
+    ) -> Dict[str, List[int]]:
+        """
+        Long-tail partition: each client has a few "major" classes (with lots of
+        samples) and many "minor" classes (with very few samples, or none).
+
+        This creates extreme class imbalance per client, ideal for testing
+        prototype-based OOD routing: the expert is strong on major classes
+        but weak/absent on minor classes.
+
+        Config:
+          longtail_major_classes: how many classes each client dominates (default: 3)
+          longtail_major_ratio: fraction of client's data from major classes (default: 0.9)
+        """
+        num_clients = self.config.num_clients
+        num_classes = 10
+        major_k = min(int(self.config.longtail_major_classes), num_classes)
+        major_ratio = float(self.config.longtail_major_ratio)
+
+        cache_path = Path(self.config.cache_dir) / f"longtail_{split_name}_k{major_k}_r{major_ratio}_c{num_clients}_s{self.seed}.json"
+        if cache_path.exists():
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            LOGGER.info("Loaded cached longtail %s partition from %s", split_name, cache_path)
+            return {k: list(v) for k, v in payload["partitions"].items()}
+
+        rng = random.Random(self.seed)
+
+        # Group indices by class
+        class_indices: Dict[int, List[int]] = defaultdict(list)
+        for idx, label in enumerate(labels):
+            if idx not in exclude:
+                class_indices[label].append(idx)
+        for cls in class_indices:
+            rng.shuffle(class_indices[cls])
+
+        # Assign major classes to each client (round-robin with offset)
+        all_classes = list(range(num_classes))
+        client_major_classes: Dict[str, List[int]] = {}
+        for i in range(num_clients):
+            start = (i * major_k) % num_classes
+            majors = [(start + j) % num_classes for j in range(major_k)]
+            client_major_classes[f"client_{i:02d}"] = majors
+
+        # Total samples per client (roughly equal)
+        total_available = sum(len(v) for v in class_indices.values())
+        per_client = total_available // num_clients
+
+        # Per-class cursors
+        class_cursors: Dict[int, int] = {c: 0 for c in range(num_classes)}
+
+        def take_from_class(cls: int, count: int) -> List[int]:
+            cursor = class_cursors[cls]
+            available = class_indices[cls]
+            actual = min(count, len(available) - cursor)
+            result = available[cursor:cursor + actual]
+            class_cursors[cls] = cursor + actual
+            return result
+
+        client_indices: Dict[str, List[int]] = {}
+
+        for client_name in sorted(client_major_classes.keys()):
+            majors = client_major_classes[client_name]
+            minors = [c for c in all_classes if c not in majors]
+
+            major_count = int(per_client * major_ratio)
+            minor_count = per_client - major_count
+
+            samples = []
+            # Major classes: split evenly
+            per_major = major_count // max(len(majors), 1)
+            for cls in majors:
+                samples.extend(take_from_class(cls, per_major))
+
+            # Minor classes: small amount each (or 0)
+            if minors:
+                per_minor = minor_count // len(minors)
+                for cls in minors:
+                    samples.extend(take_from_class(cls, per_minor))
+
+            rng.shuffle(samples)
+            client_indices[client_name] = samples
+
+        client_indices = {k: v for k, v in client_indices.items() if len(v) > 0}
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps({"partitions": client_indices}, indent=2), encoding="utf-8")
+        LOGGER.info("Saved longtail %s partition to %s | major_k=%d major_ratio=%.2f",
+                     split_name, cache_path, major_k, major_ratio)
+        return client_indices
 
     def make_loader(self, dataset: Dataset, shuffle: bool) -> DataLoader:
         return DataLoader(

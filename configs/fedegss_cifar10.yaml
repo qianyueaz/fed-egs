@@ -1,4 +1,4 @@
-experiment_name: fedegsd_cifar10
+experiment_name: fedegss_cifar10
 output_dir: ./artifacts
 
 dataset:
@@ -13,54 +13,57 @@ dataset:
   complex_easy_ratio: 0.30
   batch_size: 128
   num_workers: 8
-  # difficulty_checkpoint only needed for partition_strategy=difficulty_skewed
+  # No teacher checkpoint needed for dirichlet partition
   difficulty_checkpoint: ./artifacts/checkpoints/cifar10_resnet18_teacher.pt
   partition_cache_name: client_partitions.json
-  # Dirichlet alpha: 0.1=extreme non-IID, 0.5=moderate, 1.0=mild
   dirichlet_alpha: 0.1
-  # Long-tail (unused when strategy=dirichlet, kept for easy switching)
   longtail_major_classes: 3
   longtail_major_ratio: 0.9
-  # Public data for routing threshold calibration
-  public_dataset_size: 1000
-  public_split_strategy: random
-  public_per_class_ratio: 0.0
+  public_dataset_size: 0
+  public_split_strategy: per_class_ratio
+  public_per_class_ratio: 0.05
 
 federated:
-  server_algorithm: fedegsd
+  server_algorithm: fedegss
   client_algorithm: sgd_expert_local
   compare_algorithms:
-    # - fedavg
-    # - fedprox
+    - fedavg
   sequential_simulation: true
   rounds: 100
   clients_per_round: 10
-  local_epochs: 40
+  local_epochs: 5
   local_lr: 0.01
   local_momentum: 0.9
   local_weight_decay: 0.0005
   prox_mu: 0.001
 
-  # --- Server-side distillation (FedDF aligned) ---
-  distill_epochs: 5
+  # --- Server-side FedDF distillation (after delta writeback) ---
+  distill_epochs: 3
   distill_lr: 0.001
   distill_temperature: 3.0
-  distill_feature_weight: 0.3
-  distill_feature_normalize: true
   logit_align_weight: 1.0
+  feature_align_weight: 0.0
+  relation_align_weight: 0.0
 
-  # --- External distillation dataset (unlabeled, NOT from CIFAR-10) ---
-  # Options: 'cifar100', 'svhn', 'imagenet32'
+  # --- External distillation dataset ---
   distill_dataset: cifar100
   distill_dataset_root: ./data
   distill_max_samples: 10000
 
-  # --- Expert KD from general model (on private data) ---
-  expert_kd_weight: 0.5
+  # --- Expert KD from general (on private data, with warmup) ---
+  expert_kd_weight: 1.0
   expert_kd_temperature: 3.0
-  expert_kd_warmup_rounds: 20
+  expert_kd_warmup_rounds: 5
 
-  # --- No client-side KD (pure CE training) ---
+  # --- BDD-HFL: Asymmetric Bidirectional Decoupled Distillation ---
+  drel_alpha: 1.0
+  drel_beta: 8.0
+  lambda_ge: 1.0
+  lambda_eg: 0.5
+  general_head_lr: 0.001
+  drel_confidence_threshold: 0.6
+
+  # --- Unused fields (kept for compatibility) ---
   client_kd_weight: 0.0
   client_kd_temperature: 3.0
   client_feature_hint_weight: 0.0
@@ -77,15 +80,11 @@ federated:
   freeze_client_kd_weight: 0.0
   freeze_client_feature_hint_weight: 0.0
   freeze_local_lr_scale: 1.0
-  feature_align_weight: 0.0
-  relation_align_weight: 0.0
+  feature_noise_std: 0.0
   min_uncertainty_weight: 0.2
   min_client_reliability: 0.05
-  feature_noise_std: 0.0
   prototype_momentum: 0.0
-
-  # --- NO pretrain (aligned with FedDF cold-start) ---
-  general_anchor_weight: 0.2
+  general_anchor_weight: 0.0
   general_warmup_rounds: 0
   general_distill_ramp_rounds: 0
   general_distill_max_scale: 1.0
@@ -95,51 +94,32 @@ federated:
   general_pretrain_epochs: 0
   general_pretrain_lr: 0.01
   general_pretrain_imagenet_init: false
-  communication_quantization_enabled: true
-  communication_quantization_bits: 8
-
-  # --- MKD-Plus client proxy P_k (train Omega only) ---
-  proxy_enabled: true
-  proxy_trainable_scopes:
-    - classifier
-    - fc
-  proxy_temperature: 3.0
-  proxy_ce_weight: 1.0
-  proxy_kd_weight: 0.5
-  expert_proxy_kd_weight: 0.3
-  server_proxy_anchor_weight: 0.05
-
   restore_best_checkpoint: true
   device: cuda
   seed: 42
 
 model:
   architecture: width_scalable_resnet18
-  # architecture: small_cnn
-  general_architecture: teacher_resnet18
-  expert_architecture: small_cnn
   num_classes: 10
   general_width: 1.0
-  general_base_channels: 32
   expert_width: 0.25
   expert_base_channels: 32
   knowledge_dim: 512
-  baseline_architecture: small_cnn
+  baseline_architecture: width_scalable_resnet18
   baseline_width: 0.25
   baseline_base_channels: 32
 
 inference:
   routing_policy: distance_based_ood
-  confidence_threshold: 0.60
-  high_threshold: 0.60
-  low_threshold: 0.60
-  # Distance routing: cosine distance threshold for OOD detection
-  route_distance_threshold: 0.03
+  confidence_threshold: 0.85
+  high_threshold: 0.85
+  low_threshold: 0.85
+  route_distance_threshold: 0.25
   route_distance_std_multiplier: 1.5
-  min_confidence_threshold: 0.35
-  max_confidence_threshold: 0.80
+  min_confidence_threshold: 0.50
+  max_confidence_threshold: 0.95
   min_margin_threshold: 0.00
-  max_margin_threshold: 0.06
+  max_margin_threshold: 0.10
   personalized_threshold_step: 0.01
   personalized_margin_step: 0.005
   expert_priority_reliability_floor: 0.32
@@ -148,8 +128,8 @@ inference:
   simple_client_fallback_floor: 0.03
   complex_client_fallback_floor: 0.10
   public_teacher_gap_guard: 0.03
-  route_hard_confidence_delta: 0.01
-  route_hard_margin_delta: 0.005
+  route_hard_confidence_delta: 0.03
+  route_hard_margin_delta: 0.02
   route_warmup_rounds: 0
   route_warmup_confidence_threshold: 0.40
   route_disable_distance_during_warmup: true

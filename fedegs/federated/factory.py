@@ -2,6 +2,8 @@ from fedegs.federated.algorithms.fedavg import FedAvgServer
 from fedegs.federated.algorithms.fedegs import FedEGSServer
 from fedegs.federated.algorithms.fedegs2 import FedEGS2Server
 from fedegs.federated.algorithms.fedegsd import FedEGSDServer
+from fedegs.federated.algorithms.fedegsd_s import FedEGSDSServer
+from fedegs.federated.algorithms.fedegss import FedEGSSServer
 from fedegs.federated.algorithms.fedprox import FedProxServer
 
 
@@ -13,6 +15,10 @@ def create_federated_server(name: str, config, client_datasets, client_test_data
         return FedEGS2Server(config, client_datasets, client_test_datasets, data_module, test_hard_indices, writer, public_dataset=public_dataset)
     if normalized in {"fedegsd", "fedegs-d", "fedegs_d"}:
         return FedEGSDServer(config, client_datasets, client_test_datasets, data_module, test_hard_indices, writer, public_dataset=public_dataset)
+    if normalized in {"fedegsd-s", "fedegsd_s", "fedegsds"}:
+        return FedEGSDSServer(config, client_datasets, client_test_datasets, data_module, test_hard_indices, writer, public_dataset=public_dataset)
+    if normalized in {"fedegss", "fedegs-s", "fedegs_s"}:
+        return FedEGSSServer(config, client_datasets, client_test_datasets, data_module, test_hard_indices, writer, public_dataset=public_dataset)
     if normalized == "fedavg":
         return FedAvgServer(config, client_datasets, client_test_datasets, data_module, test_hard_indices, writer)
     if normalized in {"ideal", "ideal_upper_bound", "fat_client"}:

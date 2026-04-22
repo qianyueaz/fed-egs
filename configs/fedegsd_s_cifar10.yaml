@@ -1,0 +1,145 @@
+experiment_name: fedegsd_s_cifar10
+output_dir: ./artifacts
+
+dataset:
+  name: cifar10
+  root: ./data
+  partition_strategy: difficulty_skewed
+  num_clients: 20
+  simple_clients: 10
+  complex_clients: 10
+  hard_ratio: 0.30
+  simple_easy_ratio: 0.90
+  complex_easy_ratio: 0.30
+  batch_size: 128
+  num_workers: 8
+  # Used when partition_strategy=difficulty_skewed, and also reused here as an
+  # optional teacher checkpoint for general-model initialization.
+  difficulty_checkpoint: ./artifacts/checkpoints/cifar10_resnet18_teacher.pt
+  partition_cache_name: client_partitions.json
+  # Dirichlet alpha: 0.1=extreme non-IID, 0.5=moderate, 1.0=mild
+  dirichlet_alpha: 0.1
+  longtail_major_classes: 3
+  longtail_major_ratio: 0.9
+  # fedegsd-s keeps the general model local and frozen on clients, so a public
+  # split is optional and not required for the main training path.
+  public_dataset_size: 0
+  public_split_strategy: per_class_ratio
+  public_per_class_ratio: 0.05
+
+federated:
+  server_algorithm: fedegsd-s
+  client_algorithm: sgd_expert_local
+  compare_algorithms:
+    - fedavg
+    - fedprox
+    - fedegsd
+  sequential_simulation: true
+  rounds: 150
+  clients_per_round: 10
+  local_epochs: 5
+  local_lr: 0.01
+  local_momentum: 0.9
+  local_weight_decay: 0.0005
+
+  # Expert personalization toward the previous local expert state
+  prox_mu: 0.0005
+
+  # Frozen-general -> expert asymmetric DKD on clients
+  expert_kd_temperature: 3.0
+  expert_kd_warmup_rounds: 0
+  drel_alpha: 1.0
+  drel_beta: 8.0
+  lambda_ge: 1.0
+  client_feature_hint_weight: 0.0
+
+  # The following server-side refresh knobs are kept only for compatibility.
+  # They are disabled by default because clients never train the general model.
+  distill_epochs: 0
+  distill_lr: 0.001
+  distill_temperature: 3.0
+  distill_dataset: cifar100
+  distill_dataset_root: ./data
+  distill_max_samples: 0
+  enable_server_general_distill: false
+  lambda_eg: 0.0
+  general_head_lr: 0.0
+  general_anchor_weight: 0.0
+  drel_confidence_threshold: 0.70
+  logit_align_weight: 0.0
+  feature_align_weight: 0.0
+  relation_align_weight: 0.0
+  min_uncertainty_weight: 0.2
+  min_client_reliability: 0.05
+  general_warmup_rounds: 0
+  general_distill_ramp_rounds: 0
+  general_distill_max_scale: 0.0
+
+  # Initialize the frozen local general model from the CIFAR-10 teacher if available
+  general_init_from_teacher: true
+  general_pretrain_on_public: false
+  general_pretrain_epochs: 0
+  general_pretrain_lr: 0.01
+  general_pretrain_imagenet_init: false
+  general_freeze_patience: 999
+
+  # Compatibility fields kept explicit for this codebase
+  expert_kd_weight: 0.0
+  client_kd_weight: 0.0
+  client_kd_temperature: 3.0
+  client_hard_weight: 0.0
+  client_hard_focus_power: 1.0
+  client_hard_margin_threshold: 0.20
+  client_hard_extra_weight: 0.0
+  hard_subset_ratio: 0.0
+  hard_subset_kd_boost: 0.0
+  hard_subset_hint_boost: 0.0
+  expert_refresh_epochs: 0
+  expert_refresh_lr_scale: 0.0
+  freeze_expert_refresh_epochs: 0
+  freeze_client_kd_weight: 0.0
+  freeze_client_feature_hint_weight: 0.0
+  freeze_local_lr_scale: 1.0
+  feature_noise_std: 0.0
+  prototype_momentum: 0.0
+
+  restore_best_checkpoint: true
+  device: cuda
+  seed: 42
+
+model:
+  architecture: width_scalable_resnet18
+  num_classes: 10
+  general_width: 1.0
+  expert_width: 0.25
+  expert_base_channels: 32
+  knowledge_dim: 512
+  baseline_architecture: width_scalable_resnet18
+  baseline_width: 0.25
+  baseline_base_channels: 32
+
+inference:
+  routing_policy: prototype_distance_general_fallback
+  expert_confidence_mode: prototype_distance_only
+  confidence_threshold: 0.85
+  high_threshold: 0.85
+  low_threshold: 0.85
+  route_distance_threshold: 0.25
+  route_distance_std_multiplier: 1.5
+  min_confidence_threshold: 0.50
+  max_confidence_threshold: 0.95
+  min_margin_threshold: 0.00
+  max_margin_threshold: 0.10
+  personalized_threshold_step: 0.01
+  personalized_margin_step: 0.005
+  expert_priority_reliability_floor: 0.32
+  expert_priority_reliability_target: 0.55
+  target_general_invocation_rate: 0.20
+  simple_client_fallback_floor: 0.03
+  complex_client_fallback_floor: 0.10
+  public_teacher_gap_guard: 0.03
+  route_hard_confidence_delta: 0.03
+  route_hard_margin_delta: 0.02
+  route_warmup_rounds: 0
+  route_warmup_confidence_threshold: 0.40
+  route_disable_distance_during_warmup: true

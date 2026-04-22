@@ -29,6 +29,11 @@ class DatasetConfig:
     public_dataset_size: int = 1000
     public_split_strategy: str = "random"
     public_per_class_ratio: float = 0.0
+    # Dirichlet partition
+    dirichlet_alpha: float = 0.5
+    # Long-tail partition
+    longtail_major_classes: int = 3
+    longtail_major_ratio: float = 0.9
 
 
 @dataclass
@@ -47,6 +52,8 @@ class FederatedConfig:
     distill_epochs: int = 1
     distill_lr: float = 0.001
     distill_temperature: float = 2.0
+    distill_feature_weight: float = 0.0
+    distill_feature_normalize: bool = True
     client_kd_weight: float = 0.5
     client_kd_temperature: float = 3.0
     client_feature_hint_weight: float = 0.3
@@ -80,12 +87,27 @@ class FederatedConfig:
     general_pretrain_epochs: int = 10
     general_pretrain_lr: float = 0.01
     general_pretrain_imagenet_init: bool = False
+    communication_quantization_enabled: bool = False
+    communication_quantization_bits: int = 8
+    proxy_enabled: bool = False
+    proxy_trainable_scopes: List[str] = field(default_factory=lambda: ["classifier", "fc"])
+    proxy_temperature: float = 3.0
+    proxy_ce_weight: float = 1.0
+    proxy_kd_weight: float = 0.5
+    expert_proxy_kd_weight: float = 0.5
+    server_proxy_anchor_weight: float = 0.0
     distill_dataset: str = "cifar100"
     distill_dataset_root: str = "./data"
     distill_max_samples: int = 0
     expert_kd_weight: float = 0.0
     expert_kd_temperature: float = 3.0
     expert_kd_warmup_rounds: int = 10
+    drel_alpha: float = 1.0
+    drel_beta: float = 8.0
+    lambda_ge: float = 1.0
+    lambda_eg: float = 0.5
+    general_head_lr: float = 0.001
+    drel_confidence_threshold: float = 0.6
     restore_best_checkpoint: bool = True
     device: str = "cuda"
     seed: int = 42
@@ -94,8 +116,11 @@ class FederatedConfig:
 @dataclass
 class ModelConfig:
     architecture: str = "width_scalable_resnet18"
+    general_architecture: str = "teacher_resnet18"
+    expert_architecture: str = "small_cnn"
     num_classes: int = 10
     general_width: float = 1.0
+    general_base_channels: int = 32
     expert_width: float = 0.25
     expert_base_channels: int = 32
     knowledge_dim: int = 512
@@ -127,6 +152,7 @@ class InferenceConfig:
     public_teacher_gap_guard: float = 0.03
     route_hard_confidence_delta: float = 0.03
     route_hard_margin_delta: float = 0.02
+    route_distance_std_multiplier: float = 1.5
     route_warmup_rounds: int = 0
     route_warmup_confidence_threshold: float = 0.40
     route_disable_distance_during_warmup: bool = True
