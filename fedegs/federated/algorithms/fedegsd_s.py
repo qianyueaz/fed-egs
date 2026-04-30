@@ -355,6 +355,107 @@ class FedEGSDSServer(BaseFederatedServer):
         self.best_snapshot: Optional[Dict[str, object]] = None
         self.route_distance_threshold = float(getattr(config.inference, "route_distance_threshold", 0.3))
 
+    def _evaluate_route_effectiveness_metrics(
+        self,
+        expert_eval: Dict[str, object],
+        general_eval: Dict[str, object],
+        routed_eval: Dict[str, object],
+    ) -> Dict[str, float]:
+        client_metrics: Dict[str, Dict[str, float]] = {}
+        self.general_model.eval()
+        with torch.no_grad():
+            for client_id, dataset in self.client_test_datasets.items():
+                loader = self.data_module.make_loader(dataset, shuffle=False)
+                client = self.clients[client_id]
+                client.expert_model.eval()
+
+                num_samples = 0
+                invoked_total = 0
+                expert_correct = 0
+                general_correct = 0
+                routed_correct = 0
+                oracle_correct = 0
+                oracle_general_invocations = 0
+                disagreement_total = 0
+                invoked_general_correct = 0
+                invoked_expert_correct = 0
+
+                for images, targets, indices in loader:
+                    images = images.to(self.device)
+                    targets_device = targets.to(self.device)
+                    expert_predictions, _ = self._predict_expert_only(client_id, images, indices.tolist())
+                    general_predictions, _ = self._predict_general_only(client_id, images, indices.tolist())
+                    routed_output = self._predict_routed(client_id, images, indices.tolist())
+                    routed_predictions = routed_output[0]
+                    batch_invocations = int(routed_output[1])
+                    route_metadata = routed_output[2] if len(routed_output) == 3 else {}
+                    route_types = route_metadata.get("route_type", [])
+                    fallback_mask = torch.tensor(
+                        [route_type == "general" for route_type in route_types],
+                        device=self.device,
+                        dtype=torch.bool,
+                    )
+
+                    batch_size = int(targets_device.numel())
+                    num_samples += batch_size
+                    invoked_total += batch_invocations
+                    expert_correct += int((expert_predictions == targets_device).sum().item())
+                    general_correct += int((general_predictions == targets_device).sum().item())
+                    routed_correct += int((routed_predictions == targets_device).sum().item())
+                    oracle_correct += int(
+                        ((expert_predictions == targets_device) | (general_predictions == targets_device)).sum().item()
+                    )
+                    oracle_general_invocations += int(
+                        ((expert_predictions != targets_device) & (general_predictions == targets_device)).sum().item()
+                    )
+                    disagreement_total += int((expert_predictions != general_predictions).sum().item())
+
+                    if fallback_mask.any():
+                        invoked_general_correct += int(
+                            (general_predictions[fallback_mask] == targets_device[fallback_mask]).sum().item()
+                        )
+                        invoked_expert_correct += int(
+                            (expert_predictions[fallback_mask] == targets_device[fallback_mask]).sum().item()
+                        )
+
+                expert_accuracy = expert_correct / max(num_samples, 1)
+                general_accuracy = general_correct / max(num_samples, 1)
+                routed_accuracy = routed_correct / max(num_samples, 1)
+                invoked_general_accuracy = invoked_general_correct / max(invoked_total, 1)
+                invoked_expert_accuracy = invoked_expert_correct / max(invoked_total, 1)
+                oracle_route_accuracy = oracle_correct / max(num_samples, 1)
+                client_metrics[client_id] = {
+                    "general_gain_over_expert": general_accuracy - expert_accuracy,
+                    "routed_gain_over_expert": routed_accuracy - expert_accuracy,
+                    "invoked_general_accuracy": invoked_general_accuracy,
+                    "invoked_expert_accuracy": invoked_expert_accuracy,
+                    "invoked_general_gain": invoked_general_accuracy - invoked_expert_accuracy,
+                    "oracle_route_accuracy": oracle_route_accuracy,
+                    "oracle_general_invocation_rate": oracle_general_invocations / max(num_samples, 1),
+                    "expert_bad_general_good_rate": oracle_general_invocations / max(num_samples, 1),
+                    "routing_regret": oracle_route_accuracy - routed_accuracy,
+                    "expert_general_disagreement_rate": disagreement_total / max(num_samples, 1),
+                }
+
+        keys = (
+            "general_gain_over_expert",
+            "routed_gain_over_expert",
+            "invoked_general_accuracy",
+            "invoked_expert_accuracy",
+            "invoked_general_gain",
+            "oracle_route_accuracy",
+            "oracle_general_invocation_rate",
+            "expert_bad_general_good_rate",
+            "routing_regret",
+            "expert_general_disagreement_rate",
+        )
+        if not client_metrics:
+            return {key: 0.0 for key in keys}
+        return {
+            key: sum(float(metrics[key]) for metrics in client_metrics.values()) / max(len(client_metrics), 1)
+            for key in keys
+        }
+
     def train(self, test_dataset: Dataset) -> List[RoundMetrics]:
         metrics: List[RoundMetrics] = []
         for round_idx in range(1, self.config.federated.rounds + 1):
@@ -370,6 +471,7 @@ class FedEGSDSServer(BaseFederatedServer):
             expert_eval = self._evaluate_predictor_on_client_tests(self._predict_expert_only, prefix="fedegsd-s-expert")
             general_eval = self._evaluate_predictor_on_client_tests(self._predict_general_only, prefix="fedegsd-s-general")
             routed_eval = self._evaluate_predictor_on_client_tests(self._predict_routed, prefix="fedegsd-s-routed")
+            extra_metrics = self._evaluate_route_effectiveness_metrics(expert_eval, general_eval, routed_eval)
 
             avg_expert_loss = sum(update.loss for update in updates) / max(len(updates), 1)
             aggregate = routed_eval["aggregate"]
@@ -383,22 +485,35 @@ class FedEGSDSServer(BaseFederatedServer):
             round_metrics = RoundMetrics(
                 round_idx=round_idx,
                 avg_client_loss=avg_expert_loss,
-                routed_accuracy=aggregate["accuracy"],
+                routed_accuracy=macro["accuracy"],
                 hard_accuracy=aggregate["hard_recall"],
                 invocation_rate=aggregate["invocation_rate"],
                 local_accuracy=macro["accuracy"],
+                weighted_accuracy=aggregate["accuracy"],
                 compute_savings=compute_profile["savings_ratio"],
+                extra_metrics=extra_metrics,
+            )
+            extra_log = (
+                f" | g_gain={extra_metrics.get('general_gain_over_expert', 0.0):.4f}"
+                f" | route_gain={extra_metrics.get('routed_gain_over_expert', 0.0):.4f}"
+                f" | invoked_g={extra_metrics.get('invoked_general_gain', 0.0):.4f}"
+                f" | oracle={extra_metrics.get('oracle_route_accuracy', 0.0):.4f}"
+                f" | oracle_g={extra_metrics.get('oracle_general_invocation_rate', 0.0):.4f}"
+                f" | e_bad_g_good={extra_metrics.get('expert_bad_general_good_rate', 0.0):.4f}"
+                f" | regret={extra_metrics.get('routing_regret', 0.0):.4f}"
             )
 
             LOGGER.info(
-                "fedegsd-s round %d | expert_loss=%.4f | routed=%.4f | expert=%.4f | general=%.4f | hard=%.4f | invoke=%.4f",
+                "fedegsd-s round %d | expert_loss=%.4f | personalized=%.4f | weighted=%.4f | expert=%.4f | general=%.4f | hard=%.4f | invoke=%.4f%s",
                 round_idx,
                 avg_expert_loss,
+                macro["accuracy"],
                 aggregate["accuracy"],
-                expert_eval["aggregate"]["accuracy"],
-                general_eval["aggregate"]["accuracy"],
+                expert_eval["macro"]["accuracy"],
+                general_eval["macro"]["accuracy"],
                 aggregate["hard_recall"],
                 aggregate["invocation_rate"],
+                extra_log,
             )
 
             if self.writer is not None:
@@ -406,8 +521,8 @@ class FedEGSDSServer(BaseFederatedServer):
                 self._log_auxiliary_accuracy_metrics(
                     "fedegsd_s",
                     round_idx,
-                    expert_eval["aggregate"]["accuracy"],
-                    general_eval["aggregate"]["accuracy"],
+                    expert_eval["macro"]["accuracy"],
+                    general_eval["macro"]["accuracy"],
                 )
 
             self._log_round_metrics("fedegsd_s", round_metrics)
@@ -415,8 +530,8 @@ class FedEGSDSServer(BaseFederatedServer):
             self._maybe_update_best_snapshot(
                 round_idx,
                 round_metrics,
-                expert_eval["aggregate"]["accuracy"],
-                general_eval["aggregate"]["accuracy"],
+                expert_eval["macro"]["accuracy"],
+                general_eval["macro"]["accuracy"],
             )
 
         self.last_history = metrics
@@ -433,6 +548,7 @@ class FedEGSDSServer(BaseFederatedServer):
         )
         expert_eval = self._evaluate_predictor_on_client_tests(self._predict_expert_only, prefix="fedegsd_s_final_expert")
         general_eval = self._evaluate_predictor_on_client_tests(self._predict_general_only, prefix="fedegsd_s_final_general")
+        extra_metrics = self._evaluate_route_effectiveness_metrics(expert_eval, general_eval, routed_eval)
         final_loss = self.last_history[-1].avg_client_loss if self.last_history else 0.0
         best_round = 0
         if self.best_snapshot is not None:
@@ -451,10 +567,12 @@ class FedEGSDSServer(BaseFederatedServer):
         return {
             "algorithm": "fedegsd-s",
             "metrics": {
-                "accuracy": routed_eval["aggregate"]["accuracy"],
-                "global_accuracy": routed_eval["aggregate"]["accuracy"],
+                "accuracy": routed_eval["macro"]["accuracy"],
+                "personalized_accuracy": routed_eval["macro"]["accuracy"],
+                "weighted_accuracy": routed_eval["aggregate"]["accuracy"],
+                "global_accuracy": routed_eval["macro"]["accuracy"],
                 "local_accuracy": routed_eval["macro"]["accuracy"],
-                "routed_accuracy": routed_eval["aggregate"]["accuracy"],
+                "routed_accuracy": routed_eval["macro"]["accuracy"],
                 "hard_accuracy": routed_eval["aggregate"]["hard_recall"],
                 "hard_sample_recall": routed_eval["aggregate"]["hard_recall"],
                 "general_invocation_rate": routed_eval["aggregate"]["invocation_rate"],
@@ -462,10 +580,11 @@ class FedEGSDSServer(BaseFederatedServer):
                 "precision_macro": routed_eval["aggregate"]["precision_macro"],
                 "recall_macro": routed_eval["aggregate"]["recall_macro"],
                 "f1_macro": routed_eval["aggregate"]["f1_macro"],
-                "expert_only_accuracy": expert_eval["aggregate"]["accuracy"],
-                "general_only_accuracy": general_eval["aggregate"]["accuracy"],
+                "expert_only_accuracy": expert_eval["macro"]["accuracy"],
+                "general_only_accuracy": general_eval["macro"]["accuracy"],
                 "final_training_loss": final_loss,
                 "best_round": best_round,
+                **extra_metrics,
             },
             "client_metrics": {
                 "routed": routed_eval["clients"],

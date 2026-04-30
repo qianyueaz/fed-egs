@@ -4,13 +4,15 @@ output_dir: ./artifacts
 dataset:
   name: cifar10
   root: ./data
-  partition_strategy: difficulty_skewed
+  partition_strategy: dirichlet
   num_clients: 20
   simple_clients: 10
   complex_clients: 10
   hard_ratio: 0.30
   simple_easy_ratio: 0.90
   complex_easy_ratio: 0.30
+  dirichlet_alpha: 0.2
+  dirichlet_min_client_size: 32
   batch_size: 128
   num_workers: 0
   difficulty_checkpoint: ./artifacts/checkpoints/cifar10_resnet18_teacher.pt

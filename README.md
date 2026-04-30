@@ -7,7 +7,7 @@ PyTorch implementation of a Federated Expert-General Subnetwork validation frame
 - WidthScalableResNet18 with width 1.0 general model and width 0.25 expert subnet
 - Static supernet-to-subnet weight slicing and server-side expert delta aggregation
 - CIFAR-10 train/test difficulty scoring, persistent client partition caching, and a reusable public distillation split
-- Independent algorithm files for `FedAvg`, `FedProx`, `Fed-EGS`, and `FedEGS-2`
+- Independent algorithm files for `FedAvg`, `FedProx`, `FedALA`, `ConFREE`, `pFedFDA`, `Fed-EGS`, and `FedEGS-2`
 - A unified experiment runner that executes multiple algorithms with one shared config
 - Time-stamped local file logging, clearly named TensorBoard runs, and JSON experiment export
 - Single-process sequential client simulation for low-memory devices
@@ -28,9 +28,11 @@ python train.py --config configs/fedegs_cifar10.yaml
 ## Structure
 
 - Algorithm implementations:
+  - `fedegs/federated/algorithms/fedala.py`
   - `fedegs/federated/algorithms/fedegs.py`
   - `fedegs/federated/algorithms/fedavg.py`
   - `fedegs/federated/algorithms/fedprox.py`
+  - `fedegs/federated/algorithms/pfedfda.py`
   - `fedegs/federated/algorithms/fedegs2.py`
 - Unified experiment runner:
   - `fedegs/experiment.py`
@@ -41,6 +43,7 @@ python train.py --config configs/fedegs_cifar10.yaml
 - TensorBoard: `tensorboard --logdir artifacts/tensorboard` and each run is stored under `artifacts/tensorboard/<experiment>/<experiment>_<algorithm>_YYYYMMDD_HHMMSS/`
 - Cached difficulty splits and client partitions: `artifacts/cache/`
 - Experiment results: `artifacts/experiment_results.json`
+- Metric and method reference: `METRICS_AND_METHODS.md`
 
 ## Notes
 
@@ -75,4 +78,34 @@ dataset:
   public_split_strategy: per_class_ratio
   public_per_class_ratio: 0.05
   public_dataset_size: 0
+```
+
+## FedALA
+
+`FedALA` is included as a personalized federated baseline for accuracy-oriented comparisons. Each client keeps its own local model, performs adaptive local aggregation with the current global model before local training, and then the server averages the resulting client updates as in a standard FL loop.
+
+Run:
+
+```bash
+python train.py --config configs/fedala_cifar10.yaml
+```
+
+## ConFREE
+
+`ConFREE` is included as a recent personalized federated baseline. It reuses the same client-side personalized local model flow as `FedALA`, but replaces sample-weighted server averaging with ConFREE conflict-free update aggregation.
+
+Run:
+
+```bash
+python train.py --config configs/confree_cifar10.yaml
+```
+
+## pFedFDA
+
+`pFedFDA` is included as a NeurIPS 2024 personalized federated baseline. It trains a shared feature extractor, estimates client feature distributions, adapts local/global Gaussian statistics, and evaluates with a personalized LDA classifier.
+
+Run:
+
+```bash
+python train.py --config configs/pfedfda_cifar10.yaml
 ```

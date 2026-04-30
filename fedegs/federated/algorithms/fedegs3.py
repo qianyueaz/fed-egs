@@ -209,7 +209,10 @@ class FedEGS3Server(BaseFederatedServer):
 
             if self.writer is not None:
                 self.writer.add_scalar("distill_loss/fedegs3", distill_loss, round_idx)
-                self.writer.add_scalar("prototype/num_classes_covered", len(global_prototypes), round_idx)
+                if hasattr(self.writer, "add_algorithm_scalar"):
+                    self.writer.add_algorithm_scalar("fedegs3", "prototype/num_classes_covered", len(global_prototypes), round_idx)
+                else:
+                    self.writer.add_scalar("prototype/num_classes_covered_fedegs3", len(global_prototypes), round_idx)
                 self._log_auxiliary_accuracy_metrics(
                     "fedegs3", round_idx,
                     expert_eval["aggregate"]["accuracy"],

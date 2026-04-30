@@ -267,19 +267,20 @@ class FedEGSServer(BaseFederatedServer):
             round_metrics = RoundMetrics(
                 round_idx=round_idx,
                 avg_client_loss=avg_loss,
-                routed_accuracy=aggregate["accuracy"],
+                routed_accuracy=macro["accuracy"],
                 hard_accuracy=aggregate["hard_recall"],
                 invocation_rate=aggregate["invocation_rate"],
                 local_accuracy=macro["accuracy"],
+                weighted_accuracy=aggregate["accuracy"],
                 compute_savings=compute_profile["savings_ratio"],
             )
 
             LOGGER.info(
-                "fedegs round %d | loss=%.4f | global_acc=%.4f | local_acc=%.4f | hard_recall=%.4f | invocation=%.4f | savings=%.4f | knowledge_classes=%d",
+                "fedegs round %d | loss=%.4f | personalized_acc=%.4f | weighted_acc=%.4f | hard_recall=%.4f | invocation=%.4f | savings=%.4f | knowledge_classes=%d",
                 round_idx,
                 avg_loss,
-                aggregate["accuracy"],
                 macro["accuracy"],
+                aggregate["accuracy"],
                 aggregate["hard_recall"],
                 aggregate["invocation_rate"],
                 compute_profile["savings_ratio"],
@@ -288,15 +289,15 @@ class FedEGSServer(BaseFederatedServer):
             LOGGER.info(
                 "fedegs auxiliary round %d | expert_acc=%.4f | general_acc=%.4f",
                 round_idx,
-                expert_eval["aggregate"]["accuracy"],
-                general_eval["aggregate"]["accuracy"],
+                expert_eval["macro"]["accuracy"],
+                general_eval["macro"]["accuracy"],
             )
 
             self._log_auxiliary_accuracy_metrics(
                 "fedegs",
                 round_idx,
-                expert_eval["aggregate"]["accuracy"],
-                general_eval["aggregate"]["accuracy"],
+                expert_eval["macro"]["accuracy"],
+                general_eval["macro"]["accuracy"],
             )
             self._log_round_metrics("fedegs", round_metrics)
             history.append(round_metrics)
@@ -330,20 +331,22 @@ class FedEGSServer(BaseFederatedServer):
         )
 
         if self.writer is not None:
-            self.writer.add_scalar("fedegs_summary/global_accuracy", routed_eval["aggregate"]["accuracy"], 0)
-            self.writer.add_scalar("fedegs_summary/local_accuracy", routed_eval["macro"]["accuracy"], 0)
-            self.writer.add_scalar("fedegs_summary/hard_recall", routed_eval["aggregate"]["hard_recall"], 0)
-            self.writer.add_scalar("fedegs_summary/compute_savings", routed_compute["savings_ratio"], 0)
-            self.writer.add_scalar("memory/expert_mb", model_memory_mb(self.reference_expert), 0)
-            self.writer.add_scalar("memory/general_mb", model_memory_mb(self.general_model), 0)
+            if hasattr(self.writer, "add_algorithm_scalar"):
+                self.writer.add_algorithm_scalar("fedegs", "memory/expert_mb", model_memory_mb(self.reference_expert), 0)
+                self.writer.add_algorithm_scalar("fedegs", "memory/general_mb", model_memory_mb(self.general_model), 0)
+            else:
+                self.writer.add_scalar("memory/expert_mb_fedegs", model_memory_mb(self.reference_expert), 0)
+                self.writer.add_scalar("memory/general_mb_fedegs", model_memory_mb(self.general_model), 0)
 
         return {
             "algorithm": "fedegs",
             "metrics": {
-                "accuracy": routed_eval["aggregate"]["accuracy"],
-                "global_accuracy": routed_eval["aggregate"]["accuracy"],
+                "accuracy": routed_eval["macro"]["accuracy"],
+                "personalized_accuracy": routed_eval["macro"]["accuracy"],
+                "weighted_accuracy": routed_eval["aggregate"]["accuracy"],
+                "global_accuracy": routed_eval["macro"]["accuracy"],
                 "local_accuracy": routed_eval["macro"]["accuracy"],
-                "routed_accuracy": routed_eval["aggregate"]["accuracy"],
+                "routed_accuracy": routed_eval["macro"]["accuracy"],
                 "hard_accuracy": routed_eval["aggregate"]["hard_recall"],
                 "hard_sample_recall": routed_eval["aggregate"]["hard_recall"],
                 "routed_hard_accuracy": routed_eval["aggregate"]["hard_recall"],
@@ -352,8 +355,8 @@ class FedEGSServer(BaseFederatedServer):
                 "precision_macro": routed_eval["aggregate"]["precision_macro"],
                 "recall_macro": routed_eval["aggregate"]["recall_macro"],
                 "f1_macro": routed_eval["aggregate"]["f1_macro"],
-                "expert_only_accuracy": expert_eval["aggregate"]["accuracy"],
-                "general_only_accuracy": general_eval["aggregate"]["accuracy"],
+                "expert_only_accuracy": expert_eval["macro"]["accuracy"],
+                "general_only_accuracy": general_eval["macro"]["accuracy"],
                 "expert_only_recall_macro": expert_eval["aggregate"]["recall_macro"],
                 "general_only_recall_macro": general_eval["aggregate"]["recall_macro"],
                 "global_hyper_knowledge_classes": len(self.global_hyper_knowledge.counts),

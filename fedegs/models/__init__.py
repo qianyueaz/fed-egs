@@ -11,7 +11,12 @@ from .width_scalable_resnet import (
     WidthScalableResNet,
     apply_expert_delta_to_general,
     average_weighted_deltas,
+    estimate_activation_memory_mb,
+    estimate_client_training_flops,
+    estimate_inference_memory_mb,
     estimate_model_flops,
+    estimate_training_memory_mb,
+    measure_peak_memory_mb,
     get_expert_state_dict,
     get_num_expert_blocks,
     load_expert_state_dict,
@@ -31,6 +36,8 @@ def build_model(
     normalized = architecture.lower()
     if normalized in {"width_scalable_resnet18", "width_scalable_resnet", "resnet18_width_scalable"}:
         return WidthScalableResNet(width_factor=width_factor, num_classes=num_classes)
+    if normalized in {"teacher_resnet18", "teacher_resnet", "resnet18_teacher", "resnet18"}:
+        return build_teacher_model(num_classes=num_classes, pretrained_imagenet=False)
     if normalized in {"small_cnn", "smallcnn"}:
         return SmallCNN(num_classes=num_classes, base_channels=base_channels)
     raise ValueError(f"Unsupported model architecture: {architecture}")
@@ -118,7 +125,12 @@ __all__ = [
     "load_teacher_checkpoint",
     "apply_expert_delta_to_general",
     "average_weighted_deltas",
+    "estimate_activation_memory_mb",
+    "estimate_client_training_flops",
+    "estimate_inference_memory_mb",
     "estimate_model_flops",
+    "estimate_training_memory_mb",
+    "measure_peak_memory_mb",
     "get_expert_state_dict",
     "get_num_expert_blocks",
     "load_expert_state_dict",

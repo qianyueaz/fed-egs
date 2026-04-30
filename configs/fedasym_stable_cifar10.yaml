@@ -1,0 +1,76 @@
+experiment_name: fedasym_stable_cifar10
+output_dir: ./artifacts
+
+dataset:
+  name: cifar10
+  root: ./data
+  partition_strategy: dirichlet
+  num_clients: 20
+  simple_clients: 10
+  complex_clients: 10
+  hard_ratio: 0.30
+  simple_easy_ratio: 0.90
+  complex_easy_ratio: 0.30
+  batch_size: 128
+  num_workers: 8
+  difficulty_checkpoint: ./artifacts/checkpoints/cifar10_resnet18_teacher.pt
+  partition_cache_name: client_partitions.json
+  dirichlet_alpha: 0.2
+  dirichlet_min_client_size: 32
+  longtail_major_classes: 3
+  longtail_major_ratio: 0.9
+  public_dataset_size: 5000
+  public_split_strategy: random
+  public_per_class_ratio: 0.0
+
+federated:
+  server_algorithm: fedasym
+  client_algorithm: sgd_expert_local
+  compare_algorithms: []
+  sequential_simulation: true
+  rounds: 200
+  clients_per_round: 10
+  local_epochs: 5
+  local_lr: 0.01
+  local_momentum: 0.9
+  local_weight_decay: 0.0005
+  prox_mu: 0.001
+
+  # Keep expert training clean while current general is weaker than expert.
+  public_distill_epochs: 0
+  distill_epochs: 5
+  distill_lr: 0.001
+  distill_temperature: 3.0
+  expert_kd_temperature: 4.0
+  uncertainty_alpha_min: 0.20
+  uncertainty_alpha_max: 0.85
+
+  # More calibration data makes fallback decisions less noisy.
+  calibration_ratio: 0.20
+  calibration_min_samples: 64
+  calibration_max_samples: 1024
+  risk_predictor_epochs: 40
+  risk_predictor_lr: 0.03
+  risk_predictor_weight_decay: 0.0001
+
+  # Conservative routing: only fallback if calibration shows real gain.
+  route_min_gain: 0.01
+  route_max_invocation_when_general_worse: 0.02
+  route_disable_when_no_gain: true
+  fedasym_best_metric: auto
+
+  dkdr_mu: 0.50
+  general_pretrain_imagenet_init: false
+  restore_best_checkpoint: true
+  device: cuda
+  seed: 42
+
+model:
+  general_architecture: teacher_resnet18
+  expert_architecture: small_cnn
+  num_classes: 10
+  expert_base_channels: 32
+
+inference:
+  routing_policy: error_predictor_general_fallback
+  error_predictor_threshold: 0.50

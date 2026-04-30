@@ -7,12 +7,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.tensorboard import SummaryWriter
 
 from fedegs.config import ExperimentConfig, apply_cli_overrides, build_runtime_paths
 from fedegs.data import CIFAR10FederatedDataModule
 from fedegs.evaluation import format_memory_table, save_metrics
 from fedegs.experiment import run_experiment_suite
+from fedegs.tensorboard import FederatedSummaryWriter
 
 
 def set_seed(seed: int) -> None:
@@ -38,6 +38,15 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--high-threshold", type=float, default=None)
     parser.add_argument("--low-threshold", type=float, default=None)
     parser.add_argument("--route-distance-threshold", dest="route_distance_threshold", type=float, default=None)
+    parser.add_argument("--error-predictor-threshold", dest="error_predictor_threshold", type=float, default=None)
+    parser.add_argument("--error-predictor-threshold-mode", dest="error_predictor_threshold_mode", default=None)
+    parser.add_argument("--error-predictor-target-precision", dest="error_predictor_target_precision", type=float, default=None)
+    parser.add_argument("--error-predictor-high-confidence-guard", dest="error_predictor_high_confidence_guard", type=float, default=None)
+    parser.add_argument("--best-checkpoint-path", dest="best_checkpoint_path", default=None)
+    parser.add_argument("--load-checkpoint-path", dest="load_checkpoint_path", default=None)
+    parser.add_argument("--eval-only-from-checkpoint", dest="eval_only_from_checkpoint", action="store_true")
+    parser.add_argument("--no-recalibrate-route-thresholds-on-load", dest="recalibrate_route_thresholds_on_load", action="store_false")
+    parser.set_defaults(recalibrate_route_thresholds_on_load=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--prox-mu", dest="prox_mu", type=float, default=None)
     return parser
@@ -88,6 +97,14 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         "high_threshold": args.high_threshold,
         "low_threshold": args.low_threshold,
         "route_distance_threshold": args.route_distance_threshold,
+        "error_predictor_threshold": args.error_predictor_threshold,
+        "error_predictor_threshold_mode": args.error_predictor_threshold_mode,
+        "error_predictor_target_precision": args.error_predictor_target_precision,
+        "error_predictor_high_confidence_guard": args.error_predictor_high_confidence_guard,
+        "best_checkpoint_path": args.best_checkpoint_path,
+        "load_checkpoint_path": args.load_checkpoint_path,
+        "eval_only_from_checkpoint": args.eval_only_from_checkpoint if args.eval_only_from_checkpoint else None,
+        "recalibrate_route_thresholds_on_load": args.recalibrate_route_thresholds_on_load,
         "num_workers": args.num_workers,
         "prox_mu": args.prox_mu,
     }
@@ -117,11 +134,11 @@ def main() -> None:
         config.federated.prox_mu,
     )
     logging.info("Single-process federated simulation enabled. Clients are trained sequentially on one device.")
-    logging.info("Personalized evaluation uses local client test sets with sample-weighted aggregation.")
+    logging.info("Personalized evaluation uses local client test sets with per-client macro-averaged accuracy.")
     logging.info("Log file: %s", log_path)
     logging.info("TensorBoard run dir: %s", config.tensorboard_dir)
 
-    writer = SummaryWriter(log_dir=config.tensorboard_dir)
+    writer = FederatedSummaryWriter(log_dir=config.tensorboard_dir)
     writer.add_text("run/name", config.run_name, 0)
     writer.add_text("run/config_yaml", Path(args.config).read_text(encoding="utf-8"), 0)
     writer.add_text("run/config_effective", str(config.to_dict()), 0)

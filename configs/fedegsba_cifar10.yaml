@@ -1,0 +1,99 @@
+experiment_name: fedegsba_cifar10
+output_dir: ./artifacts
+
+dataset:
+  name: cifar10
+  root: ./data
+  partition_strategy: dirichlet_quantity_skew
+  num_clients: 20
+  batch_size: 128
+  num_workers: 8
+  difficulty_checkpoint: ./artifacts/checkpoints/cifar10_resnet18_teacher.pt
+  partition_cache_name: client_partitions.json
+  dirichlet_alpha: 0.1
+  quantity_skew_sigma: 1.0
+  quantity_min_size: 64
+  public_dataset_size: 2500
+  public_split_strategy: per_class_ratio
+  public_per_class_ratio: 0.05
+
+federated:
+  server_algorithm: fedegsba
+  client_algorithm: supernet_slice_anchor_distill
+  compare_algorithms:
+    - fedavg
+    - fedprox
+  sequential_simulation: true
+  rounds: 200
+  clients_per_round: 10
+  local_epochs: 5
+  local_lr: 0.01
+  local_momentum: 0.9
+  local_weight_decay: 0.0005
+  prox_mu: 0.001
+
+  distill_epochs: 6
+  distill_lr: 0.001
+  distill_temperature: 2.0
+  public_ce_weight: 1.0
+  public_logit_align_weight: 1.0
+  public_teacher_confidence_threshold: 0.60
+  public_teacher_weight_power: 2.0
+  public_teacher_topk: 3
+  general_warmup_rounds: 20
+  general_distill_ramp_rounds: 20
+
+  general_pretrain_on_public: true
+  general_pretrain_epochs: 10
+  general_pretrain_lr: 0.01
+
+  lambda_ge: 0.3
+  drel_alpha: 1.0
+  drel_beta: 8.0
+  expert_kd_temperature: 3.0
+  expert_kd_warmup_rounds: 50
+  expert_kd_min_general_accuracy: 0.70
+  expert_kd_confidence_threshold: 0.70
+  expert_kd_margin_threshold: 0.10
+  expert_kd_hard_boost: 0.25
+  expert_kd_min_gate_ratio: 0.05
+  expert_kd_gate_floor: 0.05
+
+  temperature_calibration_enabled: true
+  temperature_calibration_frequency: 1
+  temperature_calibration_min: 0.8
+  temperature_calibration_max: 2.5
+  temperature_calibration_candidates: 11
+  restore_best_checkpoint: true
+  device: cuda
+  seed: 42
+
+model:
+  architecture: width_scalable_resnet18
+  general_architecture: width_scalable_resnet18
+  expert_architecture: width_scalable_resnet18
+  num_classes: 10
+  general_width: 1.0
+  general_base_channels: 32
+  expert_width: 0.5
+  expert_base_channels: 32
+  knowledge_dim: 512
+  baseline_architecture: width_scalable_resnet18
+  baseline_width: 0.5
+  baseline_base_channels: 32
+
+inference:
+  routing_policy: expert_first_general_fallback
+  confidence_threshold: 0.60
+  high_threshold: 0.60
+  low_threshold: 0.60
+  route_distance_threshold: 0.02
+  min_confidence_threshold: 0.35
+  max_confidence_threshold: 0.90
+  personalized_threshold_step: 0.02
+  route_warmup_rounds: 40
+  route_warmup_confidence_threshold: 0.80
+  routing_holdout_ratio: 0.10
+  routing_holdout_min_samples: 32
+  routing_holdout_max_samples: 256
+  client_force_general_gap: 0.12

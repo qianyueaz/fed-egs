@@ -1,0 +1,87 @@
+experiment_name: fedegsd_ablation_expert_only_cifar10
+output_dir: ./artifacts
+
+dataset:
+  name: cifar10
+  root: ./data
+  partition_strategy: dirichlet
+  num_clients: 20
+  simple_clients: 10
+  complex_clients: 10
+  hard_ratio: 0.30
+  simple_easy_ratio: 0.90
+  complex_easy_ratio: 0.30
+  batch_size: 128
+  num_workers: 8
+  difficulty_checkpoint: ./artifacts/checkpoints/cifar10_resnet18_teacher.pt
+  partition_cache_name: client_partitions.json
+  dirichlet_alpha: 0.2
+  dirichlet_min_client_size: 32
+  longtail_major_classes: 3
+  longtail_major_ratio: 0.9
+  public_dataset_size: 1000
+  public_split_strategy: random
+  public_per_class_ratio: 0.0
+
+federated:
+  server_algorithm: fedegsd
+  client_algorithm: sgd_expert_local
+  compare_algorithms: []
+  sequential_simulation: true
+  rounds: 200
+  clients_per_round: 10
+  local_epochs: 5
+  local_lr: 0.01
+  local_momentum: 0.9
+  local_weight_decay: 0.0005
+  prox_mu: 0.001
+  distill_epochs: 5
+  distill_lr: 0.001
+  distill_temperature: 3.0
+  distill_dataset: cifar100
+  distill_dataset_root: ./data
+  distill_max_samples: 10000
+  expert_kd_weight: 0.0
+  expert_kd_temperature: 3.0
+  expert_kd_warmup_rounds: 20
+  general_pretrain_imagenet_init: false
+  general_enabled: false
+  temperature_calibration_enabled: false
+  temperature_calibration_frequency: 1
+  temperature_calibration_min: 0.7
+  temperature_calibration_max: 2.5
+  temperature_calibration_candidates: 11
+  temperature_calibration_momentum: 0.5
+  restore_best_checkpoint: true
+  device: cuda
+  seed: 42
+
+model:
+  general_architecture: teacher_resnet18
+  expert_architecture: small_cnn
+  num_classes: 10
+  expert_base_channels: 32
+
+inference:
+  routing_policy: confidence_general_fallback
+  confidence_threshold: 0.60
+  routing_selection_mode: budget
+  route_margin_threshold: 0.03
+  route_distance_threshold: 1.25
+  route_score_confidence_weight: 0.55
+  route_score_margin_weight: 0.30
+  route_score_distance_weight: 0.20
+  route_distance_normalization: true
+  target_general_invocation_rate: 0.40
+  target_expert_risk: 0.22
+  min_confidence_threshold: 0.35
+  max_confidence_threshold: 0.80
+  min_margin_threshold: 0.00
+  max_margin_threshold: 0.06
+  personalized_threshold_step: 0.01
+  personalized_margin_step: 0.005
+  public_teacher_gap_guard: 0.03
+  routing_holdout_ratio: 0.10
+  routing_holdout_min_samples: 64
+  routing_holdout_max_samples: 256
+  routing_holdout_seed_offset: 17

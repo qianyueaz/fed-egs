@@ -225,6 +225,170 @@ def model_memory_mb(model: nn.Module) -> float:
     return params * 4 / (1024 ** 2)
 
 
+def _normalize_input_shape(input_shape: Tuple[int, int, int, int], batch_size: int) -> Tuple[int, int, int, int]:
+    _, channels, height, width = input_shape
+    return batch_size, channels, height, width
+
+
+def _tensor_collection_numel(value) -> int:
+    if torch.is_tensor(value):
+        return int(value.numel())
+    if isinstance(value, (list, tuple)):
+        return sum(_tensor_collection_numel(item) for item in value)
+    if isinstance(value, dict):
+        return sum(_tensor_collection_numel(item) for item in value.values())
+    return 0
+
+
+def estimate_activation_memory_mb(
+    model: nn.Module,
+    input_shape: Tuple[int, int, int, int] = (1, 3, 32, 32),
+) -> float:
+    activation_numel = 0
+    hooks = []
+
+    def activation_hook(module: nn.Module, inputs, output) -> None:
+        nonlocal activation_numel
+        activation_numel += _tensor_collection_numel(output)
+
+    for module in model.modules():
+        if module is model:
+            continue
+        if len(list(module.children())) == 0:
+            hooks.append(module.register_forward_hook(activation_hook))
+
+    was_training = model.training
+    try:
+        first_param = next(model.parameters())
+        device = first_param.device
+        dtype = first_param.dtype
+    except StopIteration:
+        device = torch.device("cpu")
+        dtype = torch.float32
+    dummy = torch.zeros(input_shape, device=device, dtype=dtype)
+    with torch.no_grad():
+        model.eval()
+        model(dummy)
+    if was_training:
+        model.train()
+
+    for hook in hooks:
+        hook.remove()
+
+    return activation_numel * 4 / (1024 ** 2)
+
+
+def estimate_inference_memory_mb(
+    model: nn.Module,
+    batch_size: int,
+    input_shape: Tuple[int, int, int, int] = (1, 3, 32, 32),
+) -> float:
+    single_sample_shape = _normalize_input_shape(input_shape, 1)
+    input_memory_mb = ((torch.zeros(single_sample_shape).numel() * 4) / (1024 ** 2)) * batch_size
+    activation_memory_mb = estimate_activation_memory_mb(model, input_shape=single_sample_shape) * batch_size
+    return model_memory_mb(model) + input_memory_mb + activation_memory_mb
+
+
+def estimate_training_memory_mb(
+    model: nn.Module,
+    batch_size: int,
+    input_shape: Tuple[int, int, int, int] = (1, 3, 32, 32),
+    optimizer_name: str = "sgd",
+) -> float:
+    optimizer_multiplier = {
+        "sgd": 0.0,
+        "sgd_momentum": 1.0,
+        "momentum": 1.0,
+        "adam": 2.0,
+        "adamw": 2.0,
+    }.get(str(optimizer_name).lower(), 0.0)
+    parameter_memory_mb = model_memory_mb(model)
+    inference_memory_mb = estimate_inference_memory_mb(model, batch_size=batch_size, input_shape=input_shape)
+    activation_and_input_mb = max(inference_memory_mb - parameter_memory_mb, 0.0)
+    gradient_memory_mb = parameter_memory_mb
+    optimizer_memory_mb = parameter_memory_mb * optimizer_multiplier
+    return parameter_memory_mb + gradient_memory_mb + optimizer_memory_mb + activation_and_input_mb
+
+
+def measure_peak_memory_mb(
+    model: nn.Module,
+    batch_size: int,
+    input_shape: Tuple[int, int, int, int] = (1, 3, 32, 32),
+    mode: str = "inference",
+    optimizer_name: str = "sgd",
+) -> float:
+    try:
+        first_param = next(model.parameters())
+    except StopIteration:
+        return 0.0
+
+    device = first_param.device
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return 0.0
+
+    effective_shape = _normalize_input_shape(input_shape, batch_size)
+    dummy = torch.zeros(effective_shape, device=device, dtype=first_param.dtype)
+    baseline_allocated = torch.cuda.memory_allocated(device)
+    was_training = model.training
+    state_backup = None
+    optimizer = None
+
+    def _optimizer_kwargs(name: str) -> Dict[str, float]:
+        normalized = str(name).lower()
+        if normalized in {"sgd_momentum", "momentum"}:
+            return {"lr": 1e-3, "momentum": 0.9}
+        if normalized in {"adam", "adamw"}:
+            return {"lr": 1e-3}
+        return {"lr": 1e-3}
+
+    try:
+        if mode == "train":
+            state_backup = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+
+        if mode == "train":
+            model.train()
+            if str(optimizer_name).lower() in {"adam", "adamw"}:
+                optimizer = torch.optim.Adam(model.parameters(), **_optimizer_kwargs(optimizer_name))
+            else:
+                optimizer = torch.optim.SGD(model.parameters(), **_optimizer_kwargs(optimizer_name))
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(dummy)
+            targets = torch.zeros(logits.shape[0], device=device, dtype=torch.long)
+            loss = F.cross_entropy(logits, targets)
+            loss.backward()
+            optimizer.step()
+        else:
+            model.eval()
+            with torch.no_grad():
+                model(dummy)
+
+        torch.cuda.synchronize(device)
+        peak_allocated = torch.cuda.max_memory_allocated(device)
+        delta_mb = max(float(peak_allocated - baseline_allocated), 0.0) / (1024 ** 2)
+        return model_memory_mb(model) + delta_mb
+    finally:
+        if optimizer is not None:
+            optimizer.zero_grad(set_to_none=True)
+        if state_backup is not None:
+            model.load_state_dict(state_backup)
+        if was_training:
+            model.train()
+        else:
+            model.eval()
+
+
+def estimate_client_training_flops(
+    model_flops: float,
+    num_samples: int,
+    local_epochs: int,
+    backward_factor: float = 3.0,
+) -> float:
+    return float(model_flops) * max(float(backward_factor), 0.0) * max(int(num_samples), 0) * max(int(local_epochs), 0)
+
+
 def estimate_model_flops(model: nn.Module, input_shape: Tuple[int, int, int, int] = (1, 3, 32, 32)) -> float:
     flops = 0.0
     hooks = []

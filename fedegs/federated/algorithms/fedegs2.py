@@ -534,10 +534,11 @@ class FedEGS2Server(BaseFederatedServer):
             round_metrics = RoundMetrics(
                 round_idx=round_idx,
                 avg_client_loss=avg_expert_loss,
-                routed_accuracy=aggregate["accuracy"],
+                routed_accuracy=macro["accuracy"],
                 hard_accuracy=aggregate["hard_recall"],
                 invocation_rate=aggregate["invocation_rate"],
                 local_accuracy=macro["accuracy"],
+                weighted_accuracy=aggregate["accuracy"],
                 compute_savings=compute_profile["savings_ratio"],
             )
 
@@ -562,13 +563,13 @@ class FedEGS2Server(BaseFederatedServer):
                 sum(self.last_public_fallback_rates.values()) / max(len(self.last_public_fallback_rates), 1)
             )
             LOGGER.info(
-                "fedegs2 round %d | expert_loss=%.4f | distill_loss=%.4f | distill_scale=%.4f | global_acc=%.4f | local_acc=%.4f | hard_recall=%.4f | invocation=%.4f | savings=%.4f | public_weight=%.4f | public_teacher_gap=%.4f | public_fallback=%.4f",
+                "fedegs2 round %d | expert_loss=%.4f | distill_loss=%.4f | distill_scale=%.4f | personalized_acc=%.4f | weighted_acc=%.4f | hard_recall=%.4f | invocation=%.4f | savings=%.4f | public_weight=%.4f | public_teacher_gap=%.4f | public_fallback=%.4f",
                 round_idx,
                 avg_expert_loss,
                 distill_stats["total_loss"],
                 distill_stats["scale"],
-                aggregate["accuracy"],
                 macro["accuracy"],
+                aggregate["accuracy"],
                 aggregate["hard_recall"],
                 aggregate["invocation_rate"],
                 compute_profile["savings_ratio"],
@@ -594,8 +595,8 @@ class FedEGS2Server(BaseFederatedServer):
             LOGGER.info(
                 "fedegs2 auxiliary round %d | expert_acc=%.4f | general_acc=%.4f",
                 round_idx,
-                expert_eval["aggregate"]["accuracy"],
-                general_eval["aggregate"]["accuracy"],
+                expert_eval["macro"]["accuracy"],
+                general_eval["macro"]["accuracy"],
             )
 
             if self.writer is not None:
@@ -620,23 +621,23 @@ class FedEGS2Server(BaseFederatedServer):
                 self.writer.add_scalar("distill_relation_loss/fedegs2", distill_stats["relation_loss"], round_idx)
                 self.writer.add_scalar("distill_anchor_loss/fedegs2", distill_stats["anchor_loss"], round_idx)
                 self._log_auxiliary_accuracy_metrics(
-                    "fedegs2",
-                    round_idx,
-                    expert_eval["aggregate"]["accuracy"],
-                    general_eval["aggregate"]["accuracy"],
-                )
+                "fedegs2",
+                round_idx,
+                expert_eval["macro"]["accuracy"],
+                general_eval["macro"]["accuracy"],
+            )
 
             self._log_round_metrics("fedegs2", round_metrics)
             metrics.append(round_metrics)
             self._maybe_update_best_general_snapshot(
                 round_idx=round_idx,
-                general_accuracy=general_eval["aggregate"]["accuracy"],
+                general_accuracy=general_eval["macro"]["accuracy"],
             )
             improved = self._maybe_update_best_snapshot(
                 round_idx=round_idx,
                 round_metrics=round_metrics,
-                expert_accuracy=expert_eval["aggregate"]["accuracy"],
-                general_accuracy=general_eval["aggregate"]["accuracy"],
+                expert_accuracy=expert_eval["macro"]["accuracy"],
+                general_accuracy=general_eval["macro"]["accuracy"],
             )
             self._update_general_freeze_state(improved, round_idx)
 
@@ -686,10 +687,12 @@ class FedEGS2Server(BaseFederatedServer):
         return {
             "algorithm": "fedegs2",
             "metrics": {
-                "accuracy": routed_eval["aggregate"]["accuracy"],
-                "global_accuracy": routed_eval["aggregate"]["accuracy"],
+                "accuracy": routed_eval["macro"]["accuracy"],
+                "personalized_accuracy": routed_eval["macro"]["accuracy"],
+                "weighted_accuracy": routed_eval["aggregate"]["accuracy"],
+                "global_accuracy": routed_eval["macro"]["accuracy"],
                 "local_accuracy": routed_eval["macro"]["accuracy"],
-                "routed_accuracy": routed_eval["aggregate"]["accuracy"],
+                "routed_accuracy": routed_eval["macro"]["accuracy"],
                 "hard_accuracy": routed_eval["aggregate"]["hard_recall"],
                 "hard_sample_recall": routed_eval["aggregate"]["hard_recall"],
                 "routed_hard_accuracy": routed_eval["aggregate"]["hard_recall"],
@@ -698,8 +701,8 @@ class FedEGS2Server(BaseFederatedServer):
                 "precision_macro": routed_eval["aggregate"]["precision_macro"],
                 "recall_macro": routed_eval["aggregate"]["recall_macro"],
                 "f1_macro": routed_eval["aggregate"]["f1_macro"],
-                "expert_only_accuracy": expert_eval["aggregate"]["accuracy"],
-                "general_only_accuracy": general_eval["aggregate"]["accuracy"],
+                "expert_only_accuracy": expert_eval["macro"]["accuracy"],
+                "general_only_accuracy": general_eval["macro"]["accuracy"],
                 "expert_only_recall_macro": expert_eval["aggregate"]["recall_macro"],
                 "general_only_recall_macro": general_eval["aggregate"]["recall_macro"],
                 "public_dataset_size": len(self.public_dataset),

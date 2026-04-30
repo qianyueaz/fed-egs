@@ -1,9 +1,10 @@
 import json
+import hashlib
 import logging
 import random
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
@@ -30,6 +31,7 @@ class IndexedDataset(Dataset):
 
 PARTITION_CACHE_VERSION = 5
 PUBLIC_CACHE_VERSION = 2
+DIRICHLET_CACHE_VERSION = 2
 
 
 class CIFAR10FederatedDataModule:
@@ -70,17 +72,26 @@ class CIFAR10FederatedDataModule:
         strategy = self.config.partition_strategy.lower()
 
         if strategy in ("dirichlet", "dir"):
-            client_train_indices = self._build_dirichlet_partition(
-                labels=train_raw.targets, exclude=public_index_set, split_name="train",
+            client_train_indices, client_test_indices = self._load_or_build_aligned_dirichlet_partitions(
+                train_labels=train_raw.targets,
+                test_labels=test_raw.targets,
+                train_exclude=public_index_set,
             )
-            client_test_indices = self._build_dirichlet_partition(
-                labels=test_raw.targets, exclude=set(), split_name="test",
-            )
-            # No difficulty scoring needed — hard/easy not used for partitioning
             train_hard_indices: List[int] = []
             train_easy_indices: List[int] = list(range(len(train_raw)))
             test_hard_indices: List[int] = []
             test_easy_indices: List[int] = list(range(len(test_raw)))
+        elif strategy in ("dirichlet_quantity", "dirichlet_quantity_skew", "dirq"):
+            client_train_indices = self._build_dirichlet_quantity_skew_partition(
+                labels=train_raw.targets, exclude=public_index_set, split_name="train",
+            )
+            client_test_indices = self._build_dirichlet_quantity_skew_partition(
+                labels=test_raw.targets, exclude=set(), split_name="test",
+            )
+            train_hard_indices = []
+            train_easy_indices = list(range(len(train_raw)))
+            test_hard_indices = []
+            test_easy_indices = list(range(len(test_raw)))
         elif strategy in ("longtail", "long_tail"):
             client_train_indices = self._build_longtail_partition(
                 labels=train_raw.targets, exclude=public_index_set, split_name="train",
@@ -460,75 +471,242 @@ class CIFAR10FederatedDataModule:
             LOGGER.info("%s client %s | classes=%d/%d | %s",
                         split_name, client_id, len(classes_present), 10, dist_str)
 
-    def _build_dirichlet_partition(
+    def _dirichlet_client_names(self) -> List[str]:
+        return [f"client_{i:02d}" for i in range(int(self.config.num_clients))]
+
+    def _index_signature(self, indices: Sequence[int]) -> str:
+        digest = hashlib.sha1()
+        for index in sorted(int(idx) for idx in indices):
+            digest.update(f"{index},".encode("utf-8"))
+        return digest.hexdigest()[:16]
+
+    def _resolve_dirichlet_min_size(self, total_available: int) -> int:
+        requested = max(int(getattr(self.config, "dirichlet_min_client_size", 0)), 0)
+        num_clients = int(self.config.num_clients)
+        if num_clients <= 0:
+            raise ValueError("num_clients must be positive for Dirichlet partitioning.")
+        if total_available <= 0:
+            return 0
+        return min(requested, total_available // num_clients)
+
+    def _dirichlet_pair_cache_path(
         self,
-        labels: Sequence[int],
-        exclude: set,
-        split_name: str,
-    ) -> Dict[str, List[int]]:
+        alpha: float,
+        train_min_size: int,
+        test_min_size: int,
+        public_signature: str,
+    ) -> Path:
+        return (
+            Path(self.config.cache_dir)
+            / (
+                f"dirichlet_pair_a{alpha}_tr{train_min_size}_te{test_min_size}"
+                f"_c{self.config.num_clients}_s{self.seed}_p{public_signature}.json"
+            )
+        )
+
+    def _dirichlet_pair_cache_metadata(
+        self,
+        alpha: float,
+        train_min_size: int,
+        test_min_size: int,
+        public_signature: str,
+        train_exclude_count: int,
+        class_proportions: List[List[float]],
+    ) -> Dict[str, object]:
+        return {
+            "seed": self.seed,
+            "num_clients": int(self.config.num_clients),
+            "dirichlet_alpha": alpha,
+            "dirichlet_min_client_size": max(int(getattr(self.config, "dirichlet_min_client_size", 0)), 0),
+            "effective_train_min_client_size": train_min_size,
+            "effective_test_min_client_size": test_min_size,
+            "public_dataset_size": int(self.config.public_dataset_size),
+            "public_split_strategy": self.config.public_split_strategy,
+            "public_per_class_ratio": float(self.config.public_per_class_ratio),
+            "public_indices_signature": public_signature,
+            "public_indices_count": train_exclude_count,
+            "partition_mode": "shared_client_distribution_across_train_and_test",
+            "dirichlet_cache_version": DIRICHLET_CACHE_VERSION,
+            "class_proportions_signature": self._index_signature(
+                [int(round(value * 1_000_000)) for row in class_proportions for value in row]
+            ),
+        }
+
+    def _dirichlet_pair_cache_matches(
+        self,
+        metadata: Dict[str, object],
+        alpha: float,
+        train_min_size: int,
+        test_min_size: int,
+        public_signature: str,
+        train_exclude_count: int,
+    ) -> bool:
+        expected = {
+            "seed": self.seed,
+            "num_clients": int(self.config.num_clients),
+            "dirichlet_alpha": alpha,
+            "dirichlet_min_client_size": max(int(getattr(self.config, "dirichlet_min_client_size", 0)), 0),
+            "effective_train_min_client_size": train_min_size,
+            "effective_test_min_client_size": test_min_size,
+            "public_dataset_size": int(self.config.public_dataset_size),
+            "public_split_strategy": self.config.public_split_strategy,
+            "public_per_class_ratio": float(self.config.public_per_class_ratio),
+            "public_indices_signature": public_signature,
+            "public_indices_count": train_exclude_count,
+            "partition_mode": "shared_client_distribution_across_train_and_test",
+            "dirichlet_cache_version": DIRICHLET_CACHE_VERSION,
+        }
+        return all(metadata.get(key) == value for key, value in expected.items())
+
+    def _load_or_build_aligned_dirichlet_partitions(
+        self,
+        train_labels: Sequence[int],
+        test_labels: Sequence[int],
+        train_exclude: set,
+    ) -> Tuple[Dict[str, List[int]], Dict[str, List[int]]]:
         """
-        Dirichlet distribution partition (Hsu et al., FedDF).
-        alpha controls non-IID degree:
-          alpha → 0: each client gets only 1 class
-          alpha → ∞: uniform IID distribution
-          alpha = 0.1: strongly non-IID (typical for FL experiments)
-          alpha = 0.5: moderately non-IID
+        Sample one shared client-class Dirichlet distribution on the official train
+        split and use the same client distribution to allocate both train and test.
+        This keeps each client's evaluation distribution aligned with its training
+        distribution while still preserving the canonical CIFAR-10 train/test split.
         """
         import numpy as np
 
         alpha = float(self.config.dirichlet_alpha)
-        num_clients = self.config.num_clients
-        num_classes = 10  # CIFAR-10
+        num_clients = int(self.config.num_clients)
+        if num_clients <= 0:
+            raise ValueError("num_clients must be positive for Dirichlet partitioning.")
+        if alpha <= 0.0:
+            raise ValueError(f"dirichlet_alpha must be positive, got {alpha}.")
 
-        cache_path = Path(self.config.cache_dir) / f"dirichlet_{split_name}_a{alpha}_c{num_clients}_s{self.seed}.json"
+        train_available = sum(1 for idx in range(len(train_labels)) if idx not in train_exclude)
+        test_available = len(test_labels)
+        train_min_size = self._resolve_dirichlet_min_size(train_available)
+        test_min_size = self._resolve_dirichlet_min_size(test_available)
+        public_signature = self._index_signature(sorted(train_exclude))
+        cache_path = self._dirichlet_pair_cache_path(alpha, train_min_size, test_min_size, public_signature)
+
         if cache_path.exists():
             payload = json.loads(cache_path.read_text(encoding="utf-8"))
-            LOGGER.info("Loaded cached dirichlet %s partition from %s", split_name, cache_path)
-            return {k: list(v) for k, v in payload["partitions"].items()}
+            if self._dirichlet_pair_cache_matches(
+                metadata=payload.get("metadata", {}),
+                alpha=alpha,
+                train_min_size=train_min_size,
+                test_min_size=test_min_size,
+                public_signature=public_signature,
+                train_exclude_count=len(train_exclude),
+            ):
+                LOGGER.info("Loaded cached aligned dirichlet partitions from %s", cache_path)
+                return (
+                    {client_id: list(indices) for client_id, indices in payload["train_partitions"].items()},
+                    {client_id: list(indices) for client_id, indices in payload["test_partitions"].items()},
+                )
+            LOGGER.warning("Aligned dirichlet cache config mismatch detected. Rebuilding partitions.")
 
+        num_classes = len(set(int(label) for label in list(train_labels) + list(test_labels)))
+        max_attempts = 512
         rng = np.random.RandomState(self.seed)
+        best_snapshot: Optional[Tuple[int, int]] = None
 
-        # Group indices by class, excluding public set
+        for attempt in range(1, max_attempts + 1):
+            class_proportions = self._sample_dirichlet_class_proportions(
+                num_classes=num_classes,
+                num_clients=num_clients,
+                alpha=alpha,
+                rng=rng,
+            )
+            train_partitions = self._allocate_dirichlet_partition_from_proportions(
+                labels=train_labels,
+                exclude=train_exclude,
+                class_proportions=class_proportions,
+                rng=rng,
+            )
+            test_partitions = self._allocate_dirichlet_partition_from_proportions(
+                labels=test_labels,
+                exclude=set(),
+                class_proportions=class_proportions,
+                rng=rng,
+            )
+            observed_train_min = min(len(indices) for indices in train_partitions.values())
+            observed_test_min = min(len(indices) for indices in test_partitions.values())
+            if best_snapshot is None or (observed_train_min, observed_test_min) > best_snapshot:
+                best_snapshot = (observed_train_min, observed_test_min)
+            if observed_train_min >= train_min_size and observed_test_min >= test_min_size:
+                cache_payload = {
+                    "metadata": self._dirichlet_pair_cache_metadata(
+                        alpha=alpha,
+                        train_min_size=train_min_size,
+                        test_min_size=test_min_size,
+                        public_signature=public_signature,
+                        train_exclude_count=len(train_exclude),
+                        class_proportions=class_proportions,
+                    ),
+                    "train_partitions": train_partitions,
+                    "test_partitions": test_partitions,
+                    "class_proportions": class_proportions,
+                }
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(json.dumps(cache_payload, indent=2), encoding="utf-8")
+                LOGGER.info(
+                    "Saved aligned dirichlet partitions to %s | alpha=%.2f train_min=%d test_min=%d attempts=%d",
+                    cache_path,
+                    alpha,
+                    observed_train_min,
+                    observed_test_min,
+                    attempt,
+                )
+                return train_partitions, test_partitions
+
+        raise RuntimeError(
+            "Failed to sample aligned Dirichlet train/test partitions that satisfy the minimum client size "
+            f"after {max_attempts} attempts. "
+            f"requested_train_min={train_min_size} requested_test_min={test_min_size} "
+            f"best_observed={best_snapshot}. "
+            "Consider lowering dataset.dirichlet_min_client_size or increasing dirichlet_alpha."
+        )
+
+    def _sample_dirichlet_class_proportions(
+        self,
+        num_classes: int,
+        num_clients: int,
+        alpha: float,
+        rng,
+    ) -> List[List[float]]:
+        return rng.dirichlet([alpha] * num_clients, size=num_classes).tolist()
+
+    def _allocate_dirichlet_partition_from_proportions(
+        self,
+        labels: Sequence[int],
+        exclude: set,
+        class_proportions: List[List[float]],
+        rng,
+    ) -> Dict[str, List[int]]:
+        client_names = self._dirichlet_client_names()
+        if not client_names:
+            raise ValueError("num_clients must be positive for Dirichlet partitioning.")
+
         class_indices: Dict[int, List[int]] = defaultdict(list)
         for idx, label in enumerate(labels):
             if idx not in exclude:
-                class_indices[label].append(idx)
+                class_indices[int(label)].append(idx)
 
-        # Sample Dirichlet proportions for each class
-        client_indices: Dict[str, List[int]] = {f"client_{i:02d}": [] for i in range(num_clients)}
-        client_names = sorted(client_indices.keys())
-
-        for cls in range(num_classes):
-            indices = class_indices[cls]
+        client_indices: Dict[str, List[int]] = {name: [] for name in client_names}
+        for cls, class_distribution in enumerate(class_proportions):
+            indices = list(class_indices.get(cls, []))
+            if not indices:
+                continue
             rng.shuffle(indices)
-
-            # Dirichlet distribution: how to split this class across clients
-            proportions = rng.dirichlet([alpha] * num_clients)
-            # Convert proportions to sample counts
-            proportions = proportions / proportions.sum()
-            counts = (proportions * len(indices)).astype(int)
-            # Distribute remainder
-            remainder = len(indices) - counts.sum()
-            for r in range(remainder):
-                counts[r % num_clients] += 1
-
+            counts = rng.multinomial(len(indices), class_distribution)
             cursor = 0
-            for i, name in enumerate(client_names):
-                client_indices[name].extend(indices[cursor:cursor + counts[i]])
-                cursor += counts[i]
+            for client_idx, name in enumerate(client_names):
+                take_count = int(counts[client_idx])
+                if take_count <= 0:
+                    continue
+                client_indices[name].extend(indices[cursor : cursor + take_count])
+                cursor += take_count
 
-        # Shuffle within each client
-        py_rng = random.Random(self.seed)
         for name in client_names:
-            py_rng.shuffle(client_indices[name])
-
-        # Remove empty clients if any
-        client_indices = {k: v for k, v in client_indices.items() if len(v) > 0}
-
-        # Cache
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(json.dumps({"partitions": client_indices}, indent=2), encoding="utf-8")
-        LOGGER.info("Saved dirichlet %s partition to %s | alpha=%.2f", split_name, cache_path, alpha)
+            rng.shuffle(client_indices[name])
         return client_indices
 
     def _build_longtail_partition(
@@ -625,10 +803,128 @@ class CIFAR10FederatedDataModule:
                      split_name, cache_path, major_k, major_ratio)
         return client_indices
 
+    def _build_dirichlet_quantity_skew_partition(
+        self,
+        labels: Sequence[int],
+        exclude: set,
+        split_name: str,
+    ) -> Dict[str, List[int]]:
+        """
+        Dirichlet + quantity skew partition.
+
+        Each client first receives a target dataset size sampled from a log-normal
+        distribution, then samples labels according to its own Dirichlet class
+        preference. This creates both label imbalance and client-size imbalance.
+        """
+        import numpy as np
+
+        alpha = float(self.config.dirichlet_alpha)
+        sigma = max(float(getattr(self.config, "quantity_skew_sigma", 1.0)), 0.0)
+        num_clients = int(self.config.num_clients)
+        num_classes = len(set(int(label) for label in labels))
+        total_available = sum(1 for idx in range(len(labels)) if idx not in exclude)
+        effective_min_size = max(int(getattr(self.config, "quantity_min_size", 32)), 0)
+        if num_clients > 0:
+            effective_min_size = min(effective_min_size, total_available // num_clients)
+
+        cache_path = (
+            Path(self.config.cache_dir)
+            / f"dirq_{split_name}_a{alpha}_q{sigma}_m{effective_min_size}_c{num_clients}_s{self.seed}.json"
+        )
+        if cache_path.exists():
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            LOGGER.info("Loaded cached dirichlet+quantity %s partition from %s", split_name, cache_path)
+            return {k: list(v) for k, v in payload["partitions"].items()}
+
+        rng = np.random.RandomState(self.seed if split_name == "train" else self.seed + 1000)
+        py_rng = random.Random(self.seed if split_name == "train" else self.seed + 1000)
+
+        class_pools: Dict[int, List[int]] = defaultdict(list)
+        for idx, label in enumerate(labels):
+            if idx not in exclude:
+                class_pools[int(label)].append(idx)
+        for cls in class_pools:
+            py_rng.shuffle(class_pools[cls])
+
+        raw_size_weights = rng.lognormal(mean=0.0, sigma=sigma, size=num_clients) if sigma > 0 else np.ones(num_clients)
+        raw_size_weights = raw_size_weights / raw_size_weights.sum()
+        free_budget = max(total_available - (effective_min_size * num_clients), 0)
+        client_target_sizes = np.floor(raw_size_weights * free_budget).astype(int) + effective_min_size
+        remainder = total_available - int(client_target_sizes.sum())
+        if remainder > 0:
+            ordering = np.argsort(-raw_size_weights)
+            for idx in ordering[:remainder]:
+                client_target_sizes[idx] += 1
+        elif remainder < 0:
+            ordering = np.argsort(raw_size_weights)
+            for idx in ordering:
+                if remainder == 0:
+                    break
+                removable = max(int(client_target_sizes[idx]) - effective_min_size, 0)
+                if removable <= 0:
+                    continue
+                delta = min(removable, -remainder)
+                client_target_sizes[idx] -= delta
+                remainder += delta
+
+        client_class_preferences = rng.dirichlet([alpha] * num_classes, size=num_clients)
+        client_indices: Dict[str, List[int]] = {f"client_{i:02d}": [] for i in range(num_clients)}
+
+        for client_idx in range(num_clients):
+            client_name = f"client_{client_idx:02d}"
+            target_size = int(client_target_sizes[client_idx])
+            if target_size <= 0:
+                continue
+            for _ in range(target_size):
+                available_classes = [cls for cls, pool in class_pools.items() if pool]
+                if not available_classes:
+                    break
+                class_probs = np.array(
+                    [client_class_preferences[client_idx, cls] for cls in available_classes],
+                    dtype=np.float64,
+                )
+                if float(class_probs.sum()) <= 0.0:
+                    class_probs = np.ones(len(available_classes), dtype=np.float64)
+                class_probs = class_probs / class_probs.sum()
+                chosen_class = int(rng.choice(available_classes, p=class_probs))
+                client_indices[client_name].append(class_pools[chosen_class].pop())
+            py_rng.shuffle(client_indices[client_name])
+
+        leftovers: List[int] = []
+        for remaining in class_pools.values():
+            leftovers.extend(remaining)
+        py_rng.shuffle(leftovers)
+        if leftovers:
+            client_names = sorted(client_indices.keys(), key=lambda name: len(client_indices[name]))
+            for offset, sample_index in enumerate(leftovers):
+                client_indices[client_names[offset % len(client_names)]].append(sample_index)
+
+        client_indices = {name: indices for name, indices in client_indices.items() if len(indices) > 0}
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps({"partitions": client_indices}, indent=2), encoding="utf-8")
+        LOGGER.info(
+            "Saved dirichlet+quantity %s partition to %s | alpha=%.2f sigma=%.2f min_size=%d",
+            split_name,
+            cache_path,
+            alpha,
+            sigma,
+            effective_min_size,
+        )
+        return client_indices
+
     def make_loader(self, dataset: Dataset, shuffle: bool) -> DataLoader:
+        num_workers = max(int(self.config.num_workers), 0)
+        # In sequential federated simulation we create many short-lived loaders,
+        # especially during per-client evaluation. Multiprocess workers there can
+        # exhaust file descriptors on Linux, so keep eval loaders single-process
+        # and avoid persistent workers for these transient loaders.
+        if not shuffle:
+            num_workers = 0
         return DataLoader(
             dataset,
             batch_size=self.config.batch_size,
             shuffle=shuffle,
-            num_workers=self.config.num_workers,
+            num_workers=num_workers,
+            persistent_workers=False,
+            pin_memory=self.device.type == "cuda",
         )

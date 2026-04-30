@@ -1,0 +1,136 @@
+experiment_name: fedegsbg_cifar10
+output_dir: ./artifacts
+
+dataset:
+  name: cifar10
+  root: ./data
+  partition_strategy: dirichlet
+  num_clients: 20
+  simple_clients: 10
+  complex_clients: 10
+  hard_ratio: 0.30
+  simple_easy_ratio: 0.90
+  complex_easy_ratio: 0.30
+  dirichlet_alpha: 0.2
+  batch_size: 128
+  num_workers: 8
+  difficulty_checkpoint: ./artifacts/checkpoints/cifar10_resnet18_teacher.pt
+  partition_cache_name: client_partitions.json
+  public_dataset_size: 2500
+  public_split_strategy: per_class_ratio
+  public_per_class_ratio: 0.05
+
+federated:
+  server_algorithm: fedegsbg
+  client_algorithm: sgd_expert_local
+  compare_algorithms:
+    - fedegssg
+    - fedegs2
+    - fedavg
+  sequential_simulation: true
+  rounds: 300
+  clients_per_round: 10
+  local_epochs: 12
+  local_lr: 0.01
+  local_momentum: 0.9
+  local_weight_decay: 0.0005
+  prox_mu: 0.001
+
+  distill_epochs: 10
+  distill_lr: 0.001
+  distill_temperature: 3.0
+  public_ce_weight: 1.0
+  public_logit_align_weight: 1.0
+  distill_feature_weight: 0.08
+  prototype_align_weight: 0.05
+  route_prior_align_weight: 0.03
+  general_anchor_weight: 0.15
+  general_warmup_rounds: 20
+  general_distill_ramp_rounds: 20
+  general_distill_max_scale: 0.20
+
+  general_init_from_teacher: false
+  general_pretrain_on_public: true
+  general_pretrain_epochs: 20
+  general_pretrain_lr: 0.01
+  general_pretrain_imagenet_init: false
+  general_deploy_ema_momentum: 0.90
+
+  expert_kd_weight: 0.12
+  expert_kd_temperature: 3.0
+  expert_kd_warmup_rounds: 80
+  expert_kd_confidence_threshold: 0.60
+  expert_kd_margin_threshold: 0.05
+  expert_kd_teacher_confidence_delta: 0.02
+  expert_kd_teacher_margin_delta: 0.02
+  expert_kd_student_confidence_ceiling: 0.88
+  expert_kd_student_margin_ceiling: 0.30
+  expert_kd_hard_boost: 0.25
+  expert_kd_target_coverage: 0.15
+  expert_kd_adaptive_coverage_enabled: true
+  expert_kd_min_gate_ratio: 0.10
+  expert_kd_gate_floor: 0.05
+
+  client_feature_hint_weight: 0.01
+  expert_personalization_weight: 0.0001
+  expert_refresh_epochs: 1
+  expert_refresh_lr_scale: 0.25
+  expert_refresh_logit_weight: 0.03
+  expert_refresh_feature_hint_weight: 0.01
+  expert_refresh_confidence_threshold: 0.65
+  expert_refresh_margin_threshold: 0.06
+  expert_refresh_gain_threshold: 0.03
+  expert_refresh_hard_boost: 0.10
+  expert_refresh_target_coverage: 0.10
+  expert_refresh_adaptive_coverage_enabled: true
+  expert_refresh_min_gate_ratio: 0.08
+  expert_refresh_gate_floor: 0.05
+
+  reliability_ema_momentum: 0.80
+  reliability_accuracy_weight: 0.70
+  reliability_alpha: 1.0
+  min_client_reliability: 0.05
+  drel_beta: 8.0
+
+  communication_quantization_enabled: true
+  communication_quantization_bits: 8
+  restore_best_checkpoint: true
+  device: cuda
+  seed: 42
+
+model:
+  architecture: small_cnn
+  general_architecture: teacher_resnet18
+  expert_architecture: small_cnn
+  num_classes: 10
+  general_width: 1.0
+  general_base_channels: 32
+  expert_width: 0.25
+  expert_base_channels: 32
+  knowledge_dim: 512
+  baseline_architecture: small_cnn
+  baseline_width: 0.25
+  baseline_base_channels: 32
+
+inference:
+  routing_policy: gain_aware_general_fallback
+  route_gain_threshold: 0.35
+  min_route_gain_threshold: -0.20
+  max_route_gain_threshold: 0.80
+  route_gain_threshold_step: 0.05
+  route_gain_confidence_weight: 0.60
+  route_gain_margin_weight: 0.35
+  route_gain_energy_weight: 0.25
+  route_gain_reliability_weight: 0.15
+  route_gain_distance_weight: 0.20
+  route_gain_prior_weight: 0.30
+  route_gain_positive_margin: 0.02
+  route_energy_threshold: -3.10
+  route_distance_threshold: 0.04
+  target_general_invocation_rate: 0.20
+  simple_target_general_invocation_rate: 0.30
+  complex_target_general_invocation_rate: 0.48
+  routing_holdout_ratio: 0.10
+  routing_holdout_min_samples: 32
+  routing_holdout_max_samples: 256
+  fusion_band: 0.03

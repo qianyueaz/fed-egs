@@ -31,6 +31,9 @@ class DatasetConfig:
     public_per_class_ratio: float = 0.0
     # Dirichlet partition
     dirichlet_alpha: float = 0.5
+    dirichlet_min_client_size: int = 32
+    quantity_skew_sigma: float = 1.0
+    quantity_min_size: int = 32
     # Long-tail partition
     longtail_major_classes: int = 3
     longtail_major_ratio: float = 0.9
@@ -49,11 +52,44 @@ class FederatedConfig:
     local_momentum: float = 0.9
     local_weight_decay: float = 5e-4
     prox_mu: float = 0.001
+    fedala_rand_percent: float = 0.8
+    fedala_layer_idx: int = 0
+    fedala_eta: float = 1.0
+    fedala_init_alpha: float = 0.5
+    fedala_convergence_threshold: float = 0.01
+    fedala_start_phase_epochs: int = 5
+    fedala_adaptation_epochs: int = 1
+    confree_alpha: float = 0.5
+    confree_solver_iterations: int = 80
+    confree_solver_lr: float = 0.05
+    pfedfda_beta: float = 0.5
+    pfedfda_beta_search: bool = True
+    pfedfda_beta_candidates: int = 11
+    pfedfda_local_beta: bool = False
+    pfedfda_eps: float = 0.0001
+    pfedfda_covariance_ridge: float = 0.0001
+    pfedfda_min_class_samples: int = 2
+    pfedfda_refresh_eval_stats: bool = True
     distill_epochs: int = 1
     distill_lr: float = 0.001
     distill_temperature: float = 2.0
+    public_distill_epochs: int = 1
     distill_feature_weight: float = 0.0
     distill_feature_normalize: bool = True
+    enable_public_in_domain_anchor: bool = True
+    public_ce_weight: float = 1.0
+    public_logit_align_weight: float = 0.8
+    external_logit_align_weight: float = 1.0
+    external_logit_align_warmup_rounds: int = 0
+    external_logit_align_ramp_rounds: int = 1
+    public_teacher_aggregation: str = "avg_logits"
+    external_teacher_aggregation: str = "avg_logits"
+    public_teacher_confidence_threshold: float = 0.60
+    public_teacher_weight_power: float = 2.0
+    public_teacher_topk: int = 3
+    public_teacher_use_temporal: bool = False
+    external_teacher_use_temporal: bool = False
+    public_teacher_use_hard_mining: bool = False
     client_kd_weight: float = 0.5
     client_kd_temperature: float = 3.0
     client_feature_hint_weight: float = 0.3
@@ -66,6 +102,7 @@ class FederatedConfig:
     hard_subset_hint_boost: float = 0.5
     expert_refresh_epochs: int = 1
     expert_refresh_lr_scale: float = 0.5
+    expert_refresh_gain_threshold: float = 0.0
     freeze_expert_refresh_epochs: int = 2
     freeze_client_kd_weight: float = 1.3
     freeze_client_feature_hint_weight: float = 0.6
@@ -73,6 +110,8 @@ class FederatedConfig:
     feature_align_weight: float = 1.0
     logit_align_weight: float = 1.0
     relation_align_weight: float = 0.0
+    prototype_align_weight: float = 0.0
+    route_prior_align_weight: float = 0.0
     feature_noise_std: float = 0.01
     min_uncertainty_weight: float = 0.2
     min_client_reliability: float = 0.05
@@ -87,28 +126,121 @@ class FederatedConfig:
     general_pretrain_epochs: int = 10
     general_pretrain_lr: float = 0.01
     general_pretrain_imagenet_init: bool = False
+    general_enabled: bool = True
     communication_quantization_enabled: bool = False
     communication_quantization_bits: int = 8
     proxy_enabled: bool = False
-    proxy_trainable_scopes: List[str] = field(default_factory=lambda: ["classifier", "fc"])
+    proxy_trainable_scopes: List[str] = field(default_factory=lambda: ["classifier", "fc", "backbone.layer4.1", "layer4.1"])
     proxy_temperature: float = 3.0
     proxy_ce_weight: float = 1.0
     proxy_kd_weight: float = 0.5
     expert_proxy_kd_weight: float = 0.5
+    proxy_fisher_enabled: bool = False
+    proxy_fisher_estimation_batches: int = 0
     server_proxy_anchor_weight: float = 0.0
+    server_fisher_anchor_weight: float = 0.0
+    general_distill_mode: str = "route_aware"
+    fallback_weight_max: float = 3.0
+    fallback_weight_confidence: float = 0.45
+    fallback_weight_route_score: float = 0.35
+    fallback_weight_disagreement: float = 0.20
+    teacher_topk: int = 4
+    proxy_fallback_ratio_mode: str = "holdout_advantage"
+    min_proxy_fallback_ratio: float = 0.01
+    max_proxy_fallback_ratio: float = 0.20
+    proxy_fallback_real_invocation_ema_weight: float = 0.7
+    proxy_fallback_invocation_ema_decay: float = 0.8
+    enable_fallback_oversampling: bool = False
     distill_dataset: str = "cifar100"
     distill_dataset_root: str = "./data"
     distill_max_samples: int = 0
+    uncertainty_alpha_min: float = 0.2
+    uncertainty_alpha_max: float = 0.8
+    calibration_ratio: float = 0.1
+    calibration_min_samples: int = 16
+    calibration_max_samples: int = 0
+    distill_gradient_clip_norm: float = 1.0
+    teacher_bank_staleness_decay: float = 0.99
+    teacher_bank_max_staleness: int = 0
+    teacher_selection_mode: str = "mean_confidence"
+    enable_general_ema_anchor: bool = True
+    dkdr_reliability_center: float = 0.5
+    dkdr_beta_temperature: float = 0.15
+    dkdr_mu: float = 0.5
+    risk_predictor_epochs: int = 40
+    risk_predictor_lr: float = 0.05
+    risk_predictor_weight_decay: float = 0.0
+    route_min_gain: float = 0.0
+    route_max_invocation_when_general_worse: float = 0.0
+    route_disable_when_no_gain: bool = True
+    fedasym_best_metric: str = "auto"
+    general_deploy_ema_momentum: float = 0.90
+    general_deploy_warmup_rounds: int = 80
+    general_deploy_warmup_momentum: float = 0.35
+    deploy_consistency_weight: float = 0.10
+    deploy_consistency_warmup_rounds: int = 0
+    deploy_consistency_ramp_rounds: int = 1
     expert_kd_weight: float = 0.0
     expert_kd_temperature: float = 3.0
     expert_kd_warmup_rounds: int = 10
+    expert_kd_min_general_accuracy: float = 0.0
+    expert_kd_confidence_threshold: float = 0.60
+    expert_kd_margin_threshold: float = 0.08
+    expert_kd_hard_boost: float = 0.40
+    expert_kd_teacher_confidence_delta: float = 0.0
+    expert_kd_teacher_margin_delta: float = 0.0
+    expert_kd_student_confidence_ceiling: float = 1.0
+    expert_kd_student_margin_ceiling: float = 1.0
+    expert_kd_gate_power: float = 1.0
+    expert_kd_target_coverage: float = 0.0
+    expert_kd_adaptive_coverage_enabled: bool = False
+    expert_kd_min_gate_ratio: float = 0.0
+    expert_kd_gate_floor: float = 0.0
+    expert_refresh_min_teacher_accuracy: float = 0.0
+    expert_refresh_confidence_threshold: float = 0.60
+    expert_refresh_margin_threshold: float = 0.08
+    expert_refresh_logit_weight: float = 0.0
+    expert_refresh_feature_hint_weight: float = 0.0
+    expert_refresh_hard_boost: float = 0.0
+    expert_refresh_target_coverage: float = 0.0
+    expert_refresh_adaptive_coverage_enabled: bool = False
+    expert_refresh_min_gate_ratio: float = 0.0
+    expert_refresh_gate_floor: float = 0.0
+    expert_personalization_weight: float = 0.0
     drel_alpha: float = 1.0
     drel_beta: float = 8.0
     lambda_ge: float = 1.0
     lambda_eg: float = 0.5
     general_head_lr: float = 0.001
     drel_confidence_threshold: float = 0.6
+    reliability_ema_momentum: float = 0.8
+    reliability_accuracy_weight: float = 0.7
+    reliability_alpha: float = 1.5
+    teacher_consistency_weight: float = 8.0
+    teacher_temporal_buffer_size: int = 5
+    teacher_temporal_momentum: float = 0.35
+    selective_proxy_ratio: float = 1.0
+    general_light_update_scope: str = "head_last_block"
+    general_full_refresh_interval: int = 10
+    general_light_distill_epochs: int = 1
+    general_teacher_ema_momentum: float = 0.90
+    temperature_calibration_enabled: bool = False
+    temperature_calibration_frequency: int = 1
+    temperature_calibration_min: float = 0.5
+    temperature_calibration_max: float = 5.0
+    temperature_calibration_candidates: int = 25
+    temperature_calibration_momentum: float = 0.5
+    hard_sample_topk: int = 3
+    hard_sample_disagreement_threshold: float = 0.30
+    hard_sample_entropy_threshold: float = 0.55
+    hard_sample_weight_power: float = 1.5
+    hard_sample_distill_boost: float = 1.25
     restore_best_checkpoint: bool = True
+    save_best_checkpoint: bool = True
+    best_checkpoint_path: Optional[str] = None
+    load_checkpoint_path: Optional[str] = None
+    eval_only_from_checkpoint: bool = False
+    recalibrate_route_thresholds_on_load: bool = True
     device: str = "cuda"
     seed: int = 42
 
@@ -132,10 +264,17 @@ class ModelConfig:
 @dataclass
 class InferenceConfig:
     routing_policy: str = "dual_threshold_general_fallback"
+    routing_selection_mode: str = "budget"
     confidence_threshold: float = 0.18
     high_threshold: float = 0.85
     low_threshold: float = 0.60
+    route_margin_threshold: float = 0.03
     route_distance_threshold: float = 0.01
+    target_expert_risk: float = 0.25
+    route_score_confidence_weight: float = 0.50
+    route_score_margin_weight: float = 0.35
+    route_score_distance_weight: float = 0.20
+    route_distance_normalization: bool = True
     min_confidence_threshold: float = 0.05
     max_confidence_threshold: float = 0.30
     min_margin_threshold: float = 0.00
@@ -147,15 +286,74 @@ class InferenceConfig:
     expert_priority_reliability_floor: float = 0.35
     expert_priority_reliability_target: float = 0.55
     target_general_invocation_rate: float = 0.20
+    simple_target_general_invocation_rate: float = 0.36
+    complex_target_general_invocation_rate: float = 0.56
     simple_client_fallback_floor: float = 0.02
     complex_client_fallback_floor: float = 0.08
     public_teacher_gap_guard: float = 0.03
+    route_hard_recall_tolerance: float = 0.005
+    routing_search_radius: int = 3
+    route_hard_priority_margin: float = 0.005
     route_hard_confidence_delta: float = 0.03
     route_hard_margin_delta: float = 0.02
     route_distance_std_multiplier: float = 1.5
+    route_energy_threshold: float = -3.0
+    min_energy_threshold: float = -6.0
+    max_energy_threshold: float = -1.0
+    personalized_energy_step: float = 0.20
     route_warmup_rounds: int = 0
     route_warmup_confidence_threshold: float = 0.40
     route_disable_distance_during_warmup: bool = True
+    route_reliability_center: float = 0.60
+    route_reliability_confidence_scale: float = 0.08
+    route_reliability_margin_scale: float = 0.015
+    route_reliability_energy_scale: float = 0.25
+    route_reliability_invocation_scale: float = 0.12
+    route_reliability_hard_bonus: float = 0.02
+    route_hard_energy_delta: float = 0.15
+    route_gain_threshold: float = 0.0
+    min_route_gain_threshold: float = -1.0
+    max_route_gain_threshold: float = 1.0
+    route_gain_threshold_step: float = 0.05
+    route_gain_search_warmup_rounds: int = 120
+    route_min_invocation_rate_scale: float = 0.50
+    route_gain_confidence_weight: float = 0.50
+    route_gain_margin_weight: float = 0.35
+    route_gain_energy_weight: float = 0.25
+    route_gain_reliability_weight: float = 0.15
+    route_gain_distance_weight: float = 0.20
+    route_gain_prior_weight: float = 0.20
+    route_gain_positive_margin: float = 0.0
+    fusion_band: float = 0.0
+    routing_holdout_ratio: float = 0.10
+    routing_holdout_min_samples: int = 64
+    routing_holdout_max_samples: int = 512
+    routing_holdout_seed_offset: int = 17
+    error_predictor_threshold: float = 0.5
+    error_predictor_threshold_mode: str = "fixed"
+    error_predictor_target_precision: float = 0.80
+    error_predictor_min_predicted_positive: int = 3
+    error_predictor_disable_on_precision_fail: bool = True
+    error_predictor_high_confidence_guard: float = 1.0
+    routing_error_min_threshold: float = 0.05
+    routing_error_max_threshold: float = 0.95
+    client_force_general_gap: float = 0.12
+    general_reliability_threshold: float = 0.55
+    general_reliability_confidence_weight: float = 0.45
+    general_reliability_margin_weight: float = 0.25
+    general_reliability_entropy_weight: float = 0.30
+    routing_general_reliability_candidates: int = 9
+    routing_general_reliability_min: float = 0.30
+    routing_general_reliability_max: float = 0.90
+    routing_veto_gain_threshold: float = 0.0
+    routing_veto_reliability_threshold: float = 0.55
+    routing_veto_min_holdout_samples: int = 64
+    routing_veto_advantage_ema_decay: float = 0.7
+    routing_veto_reliability_ema_decay: float = 0.7
+    gain_confidence_bins: int = 6
+    gain_margin_bins: int = 6
+    gain_min_bucket_support: int = 8
+    gain_min_class_support: int = 16
 
 
 @dataclass
@@ -186,7 +384,10 @@ class ExperimentConfig:
         payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
         if not isinstance(payload, dict):
             raise ValueError(f"Config file must contain a mapping at top level: {config_path}")
-        return _merge_dataclass(cls(), payload)
+        config = _merge_dataclass(cls(), payload)
+        if config.federated.compare_algorithms is None:
+            config.federated.compare_algorithms = []
+        return config
 
     def dump_yaml(self, path: str) -> None:
         Path(path).write_text(yaml.safe_dump(self.to_dict(), sort_keys=False, allow_unicode=False), encoding="utf-8")
@@ -224,6 +425,14 @@ def _resolve_override_target(config: ExperimentConfig, key: str):
         "high_threshold": (config.inference, "high_threshold"),
         "low_threshold": (config.inference, "low_threshold"),
         "route_distance_threshold": (config.inference, "route_distance_threshold"),
+        "error_predictor_threshold": (config.inference, "error_predictor_threshold"),
+        "error_predictor_threshold_mode": (config.inference, "error_predictor_threshold_mode"),
+        "error_predictor_target_precision": (config.inference, "error_predictor_target_precision"),
+        "error_predictor_high_confidence_guard": (config.inference, "error_predictor_high_confidence_guard"),
+        "best_checkpoint_path": (config.federated, "best_checkpoint_path"),
+        "load_checkpoint_path": (config.federated, "load_checkpoint_path"),
+        "eval_only_from_checkpoint": (config.federated, "eval_only_from_checkpoint"),
+        "recalibrate_route_thresholds_on_load": (config.federated, "recalibrate_route_thresholds_on_load"),
         "num_workers": (config.dataset, "num_workers"),
         "output_dir": (config, "output_dir"),
         "experiment_name": (config, "experiment_name"),
