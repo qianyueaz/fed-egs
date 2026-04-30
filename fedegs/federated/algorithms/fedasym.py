@@ -103,14 +103,44 @@ def _split_dataset_for_calibration(
     return Subset(dataset, train_indices), Subset(dataset, calibration_indices)
 
 
+def _split_dataset_for_router_validation(
+    dataset: Dataset,
+    ratio: float,
+    seed: int,
+) -> Tuple[Dataset, Dataset]:
+    total_samples = len(dataset)
+    ratio = min(max(float(ratio), 0.0), 1.0)
+    if total_samples <= 3 or ratio <= 0.0:
+        return dataset, dataset
+
+    validation_samples = int(round(total_samples * ratio))
+    validation_samples = min(max(validation_samples, 1), total_samples - 1)
+    if validation_samples <= 0 or validation_samples >= total_samples:
+        return dataset, dataset
+
+    generator = torch.Generator()
+    generator.manual_seed(int(seed))
+    permutation = torch.randperm(total_samples, generator=generator).tolist()
+    validation_indices = sorted(permutation[:validation_samples])
+    train_indices = sorted(permutation[validation_samples:])
+    if not validation_indices or not train_indices:
+        return dataset, dataset
+    return Subset(dataset, train_indices), Subset(dataset, validation_indices)
+
+
 def _clone_tensor_dict(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     return {key: value.detach().cpu().clone() for key, value in state.items()}
+
+
+def _predictor_feature_dim(num_classes: int) -> int:
+    return 8 + int(num_classes)
 
 
 def _predictor_features_from_logits(logits: torch.Tensor) -> torch.Tensor:
     probs = torch.softmax(logits, dim=1)
     topk = torch.topk(probs, k=min(2, probs.size(1)), dim=1)
     confidence = topk.values[:, 0]
+    top2_prob = topk.values[:, 1] if topk.values.size(1) > 1 else torch.zeros_like(confidence)
     if topk.values.size(1) > 1:
         margin = topk.values[:, 0] - topk.values[:, 1]
     else:
@@ -118,11 +148,46 @@ def _predictor_features_from_logits(logits: torch.Tensor) -> torch.Tensor:
     entropy = -(probs * probs.clamp_min(1e-8).log()).sum(dim=1)
     entropy = entropy / max(math.log(float(probs.size(1))), 1e-8)
     max_logit = logits.max(dim=1).values
-    return torch.stack([confidence, entropy, margin, max_logit], dim=1)
+    top_logits = torch.topk(logits, k=min(2, logits.size(1)), dim=1).values
+    if top_logits.size(1) > 1:
+        logit_margin = top_logits[:, 0] - top_logits[:, 1]
+    else:
+        logit_margin = torch.ones_like(max_logit)
+    energy = torch.logsumexp(logits, dim=1)
+    prob_variance = probs.var(dim=1, unbiased=False)
+    predicted_class = logits.argmax(dim=1)
+    predicted_class_onehot = F.one_hot(predicted_class, num_classes=logits.size(1)).to(dtype=logits.dtype)
+    dense_features = torch.stack(
+        [
+            confidence,
+            entropy,
+            margin,
+            max_logit,
+            top2_prob,
+            logit_margin,
+            energy,
+            prob_variance,
+        ],
+        dim=1,
+    )
+    return torch.cat([dense_features, predicted_class_onehot], dim=1)
 
 
-def _default_predictor_state(feature_dim: int, error_rate: float = 0.5) -> Dict[str, torch.Tensor]:
+def _default_predictor_state(
+    feature_dim: int,
+    error_rate: float = 0.5,
+    hidden_dim: int = 0,
+) -> Dict[str, torch.Tensor]:
     p = min(max(float(error_rate), 1e-4), 1.0 - 1e-4)
+    if hidden_dim > 0:
+        return {
+            "mean": torch.zeros(feature_dim, dtype=torch.float32),
+            "std": torch.ones(feature_dim, dtype=torch.float32),
+            "hidden_weight": torch.zeros(hidden_dim, feature_dim, dtype=torch.float32),
+            "hidden_bias": torch.zeros(hidden_dim, dtype=torch.float32),
+            "output_weight": torch.zeros(1, hidden_dim, dtype=torch.float32),
+            "output_bias": torch.tensor([math.log(p / (1.0 - p))], dtype=torch.float32),
+        }
     return {
         "mean": torch.zeros(feature_dim, dtype=torch.float32),
         "std": torch.ones(feature_dim, dtype=torch.float32),
@@ -131,16 +196,44 @@ def _default_predictor_state(feature_dim: int, error_rate: float = 0.5) -> Dict[
     }
 
 
+def _align_features_to_predictor_state(
+    predictor_state: Dict[str, torch.Tensor],
+    features: torch.Tensor,
+) -> torch.Tensor:
+    expected_dim = int(predictor_state["mean"].numel())
+    current_dim = int(features.size(1)) if features.ndim == 2 else 0
+    if current_dim == expected_dim:
+        return features
+    if current_dim > expected_dim:
+        return features[:, :expected_dim]
+    padding = torch.zeros(
+        features.size(0),
+        expected_dim - current_dim,
+        device=features.device,
+        dtype=features.dtype,
+    )
+    return torch.cat([features, padding], dim=1)
+
+
 def _predict_error_probabilities(
     predictor_state: Dict[str, torch.Tensor],
     features: torch.Tensor,
 ) -> torch.Tensor:
+    features = _align_features_to_predictor_state(predictor_state, features)
     mean = predictor_state["mean"].to(features.device, dtype=features.dtype)
     std = predictor_state["std"].to(features.device, dtype=features.dtype).clamp_min(1e-6)
-    weight = predictor_state["weight"].to(features.device, dtype=features.dtype)
-    bias = predictor_state["bias"].to(features.device, dtype=features.dtype)
     normalized = (features - mean) / std
-    logits = F.linear(normalized, weight, bias)
+    if "hidden_weight" in predictor_state:
+        hidden_weight = predictor_state["hidden_weight"].to(features.device, dtype=features.dtype)
+        hidden_bias = predictor_state["hidden_bias"].to(features.device, dtype=features.dtype)
+        output_weight = predictor_state["output_weight"].to(features.device, dtype=features.dtype)
+        output_bias = predictor_state["output_bias"].to(features.device, dtype=features.dtype)
+        hidden = F.relu(F.linear(normalized, hidden_weight, hidden_bias))
+        logits = F.linear(hidden, output_weight, output_bias)
+    else:
+        weight = predictor_state["weight"].to(features.device, dtype=features.dtype)
+        bias = predictor_state["bias"].to(features.device, dtype=features.dtype)
+        logits = F.linear(normalized, weight, bias)
     return torch.sigmoid(logits).squeeze(1)
 
 
@@ -178,6 +271,18 @@ def _build_error_fallback_mask(
     return fallback_mask
 
 
+def _wilson_precision_lower_bound(true_positive: int, predicted_positive: int, z: float = 1.96) -> float:
+    if predicted_positive <= 0:
+        return 0.0
+    n = float(predicted_positive)
+    p_hat = float(true_positive) / n
+    z2 = z * z
+    denominator = 1.0 + (z2 / n)
+    center = p_hat + (z2 / (2.0 * n))
+    spread = z * math.sqrt(((p_hat * (1.0 - p_hat)) + (z2 / (4.0 * n))) / n)
+    return max((center - spread) / denominator, 0.0)
+
+
 def _select_precision_constrained_threshold(
     scores: torch.Tensor,
     labels: torch.Tensor,
@@ -194,6 +299,10 @@ def _select_precision_constrained_threshold(
     disable_on_fail = bool(getattr(config.inference, "error_predictor_disable_on_precision_fail", True))
     min_threshold = float(getattr(config.inference, "routing_error_min_threshold", 0.0))
     max_threshold = float(getattr(config.inference, "routing_error_max_threshold", 1.0))
+    use_wilson = mode in {"precision_wilson", "wilson"} or bool(
+        getattr(config.inference, "error_predictor_use_wilson_lower_bound", False)
+    )
+    wilson_z = float(getattr(config.inference, "error_predictor_wilson_z", 1.96))
 
     scores = scores.detach().cpu().to(torch.float32).view(-1)
     labels = labels.detach().cpu().to(torch.bool).view(-1)
@@ -221,7 +330,8 @@ def _select_precision_constrained_threshold(
             continue
         true_positive = int((predicted & labels).sum().item())
         precision = true_positive / max(invoked, 1)
-        if precision >= target_precision and invoked > best_invoked:
+        precision_score = _wilson_precision_lower_bound(true_positive, invoked, wilson_z) if use_wilson else precision
+        if precision_score >= target_precision and invoked > best_invoked:
             best_invoked = invoked
             best_threshold = float(threshold)
 
@@ -239,22 +349,33 @@ def _fit_predictor_state(
     epochs: int,
     lr: float,
     weight_decay: float,
+    hidden_dim: int = 0,
+    dropout: float = 0.0,
 ) -> Dict[str, torch.Tensor]:
     feature_dim = int(features.size(1)) if features.ndim == 2 else 4
+    hidden_dim = max(int(hidden_dim), 0)
     if features.numel() == 0 or labels.numel() == 0:
-        return _default_predictor_state(feature_dim)
+        return _default_predictor_state(feature_dim, hidden_dim=hidden_dim)
 
     labels = labels.float().view(-1)
     features = features.float()
     positive_rate = float(labels.mean().item())
     if positive_rate <= 1e-6 or positive_rate >= 1.0 - 1e-6:
-        return _default_predictor_state(feature_dim, error_rate=positive_rate)
+        return _default_predictor_state(feature_dim, error_rate=positive_rate, hidden_dim=hidden_dim)
 
     mean = features.mean(dim=0)
     std = features.std(dim=0, unbiased=False).clamp_min(1e-6)
     normalized = (features - mean) / std
 
-    model = nn.Linear(feature_dim, 1).to(device)
+    if hidden_dim > 0:
+        model = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(p=min(max(float(dropout), 0.0), 0.9)),
+            nn.Linear(hidden_dim, 1),
+        ).to(device)
+    else:
+        model = nn.Linear(feature_dim, 1).to(device)
     pos_count = labels.sum().item()
     neg_count = labels.numel() - pos_count
     pos_weight = torch.tensor([max(neg_count / max(pos_count, 1.0), 1.0)], device=device)
@@ -274,12 +395,29 @@ def _fit_predictor_state(
             loss.backward()
             optimizer.step()
 
-    return {
+    state = {
         "mean": mean.detach().cpu().clone(),
         "std": std.detach().cpu().clone(),
-        "weight": model.weight.detach().cpu().clone(),
-        "bias": model.bias.detach().cpu().clone(),
     }
+    if hidden_dim > 0:
+        first_layer = model[0]
+        output_layer = model[3]
+        state.update(
+            {
+                "hidden_weight": first_layer.weight.detach().cpu().clone(),
+                "hidden_bias": first_layer.bias.detach().cpu().clone(),
+                "output_weight": output_layer.weight.detach().cpu().clone(),
+                "output_bias": output_layer.bias.detach().cpu().clone(),
+            }
+        )
+    else:
+        state.update(
+            {
+                "weight": model.weight.detach().cpu().clone(),
+                "bias": model.bias.detach().cpu().clone(),
+            }
+        )
+    return state
 
 
 class FedAsymClient(BaseFederatedClient):
@@ -288,6 +426,7 @@ class FedAsymClient(BaseFederatedClient):
         client_id: str,
         train_dataset: Dataset,
         calibration_dataset: Dataset,
+        threshold_dataset: Dataset,
         num_classes: int,
         device: str,
         config,
@@ -297,12 +436,16 @@ class FedAsymClient(BaseFederatedClient):
         self.config = config
         self.data_module = data_module
         self.calibration_dataset = calibration_dataset
+        self.threshold_dataset = threshold_dataset
         self.num_classes = num_classes
         self.expert_model = SmallCNN(
             num_classes=num_classes,
             base_channels=config.model.expert_base_channels,
         ).to(self.device)
-        self.predictor_state = _default_predictor_state(4)
+        self.predictor_state = _default_predictor_state(
+            _predictor_feature_dim(num_classes),
+            hidden_dim=int(getattr(config.federated, "risk_predictor_hidden_dim", 32)),
+        )
         self.error_threshold = float(getattr(config.inference, "error_predictor_threshold", 0.5))
 
     def train_local(
@@ -392,9 +535,48 @@ class FedAsymClient(BaseFederatedClient):
 
     def _fit_risk_predictor(self) -> Dict[str, torch.Tensor]:
         if self.calibration_dataset is None or len(self.calibration_dataset) == 0:
-            return _default_predictor_state(4)
+            return _default_predictor_state(
+                _predictor_feature_dim(self.num_classes),
+                hidden_dim=int(getattr(self.config.federated, "risk_predictor_hidden_dim", 32)),
+            )
 
-        loader = self.data_module.make_loader(self.calibration_dataset, shuffle=False)
+        features, labels = self._collect_predictor_features(self.calibration_dataset)
+        if features.numel() == 0 or labels.numel() == 0:
+            return _default_predictor_state(
+                _predictor_feature_dim(self.num_classes),
+                hidden_dim=int(getattr(self.config.federated, "risk_predictor_hidden_dim", 32)),
+            )
+
+        predictor_state = _fit_predictor_state(
+            features=features,
+            labels=labels,
+            device=self.device,
+            epochs=int(getattr(self.config.federated, "risk_predictor_epochs", 40)),
+            lr=float(getattr(self.config.federated, "risk_predictor_lr", 0.05)),
+            weight_decay=float(getattr(self.config.federated, "risk_predictor_weight_decay", 0.0)),
+            hidden_dim=int(getattr(self.config.federated, "risk_predictor_hidden_dim", 32)),
+            dropout=float(getattr(self.config.federated, "risk_predictor_dropout", 0.1)),
+        )
+        threshold_features, threshold_labels = self._collect_predictor_features(self.threshold_dataset)
+        if threshold_features.numel() == 0 or threshold_labels.numel() == 0:
+            threshold_features, threshold_labels = features, labels
+        error_probs = _predict_error_probabilities(predictor_state, threshold_features)
+        self.error_threshold = _select_precision_constrained_threshold(
+            scores=error_probs,
+            labels=threshold_labels,
+            features=threshold_features,
+            config=self.config,
+        )
+        return predictor_state
+
+    def _collect_predictor_features(self, dataset: Dataset) -> Tuple[torch.Tensor, torch.Tensor]:
+        if dataset is None or len(dataset) == 0:
+            return (
+                torch.empty((0, _predictor_feature_dim(self.num_classes)), dtype=torch.float32),
+                torch.empty((0,), dtype=torch.float32),
+            )
+
+        loader = self.data_module.make_loader(dataset, shuffle=False)
         feature_batches: List[torch.Tensor] = []
         label_batches: List[torch.Tensor] = []
 
@@ -410,26 +592,11 @@ class FedAsymClient(BaseFederatedClient):
                 feature_batches.append(features.cpu())
 
         if not feature_batches:
-            return _default_predictor_state(4)
-
-        features = torch.cat(feature_batches, dim=0)
-        labels = torch.cat(label_batches, dim=0)
-        predictor_state = _fit_predictor_state(
-            features=features,
-            labels=labels,
-            device=self.device,
-            epochs=int(getattr(self.config.federated, "risk_predictor_epochs", 40)),
-            lr=float(getattr(self.config.federated, "risk_predictor_lr", 0.05)),
-            weight_decay=float(getattr(self.config.federated, "risk_predictor_weight_decay", 0.0)),
-        )
-        error_probs = _predict_error_probabilities(predictor_state, features)
-        self.error_threshold = _select_precision_constrained_threshold(
-            scores=error_probs,
-            labels=labels,
-            features=features,
-            config=self.config,
-        )
-        return predictor_state
+            return (
+                torch.empty((0, _predictor_feature_dim(self.num_classes)), dtype=torch.float32),
+                torch.empty((0,), dtype=torch.float32),
+            )
+        return torch.cat(feature_batches, dim=0), torch.cat(label_batches, dim=0)
 
     def _collect_public_logits(self, public_batches: Sequence) -> torch.Tensor:
         logits_batches: List[torch.Tensor] = []
@@ -486,7 +653,9 @@ class FedAsymServer(BaseFederatedServer):
         calibration_ratio = max(float(getattr(config.federated, "calibration_ratio", 0.1)), 0.0)
         calibration_min = max(int(getattr(config.federated, "calibration_min_samples", 16)), 0)
         calibration_max = max(int(getattr(config.federated, "calibration_max_samples", 0)), 0)
+        router_validation_ratio = min(max(float(getattr(config.federated, "router_validation_ratio", 0.5)), 0.0), 1.0)
         self.client_training_datasets: Dict[str, Dataset] = {}
+        self.client_router_train_datasets: Dict[str, Dataset] = {}
         self.client_calibration_datasets: Dict[str, Dataset] = {}
         for client_id, dataset in client_datasets.items():
             train_dataset, calibration_dataset = _split_dataset_for_calibration(
@@ -496,14 +665,21 @@ class FedAsymServer(BaseFederatedServer):
                 max_samples=calibration_max,
                 seed=_stable_client_seed(config.federated.seed, client_id),
             )
+            router_train_dataset, router_validation_dataset = _split_dataset_for_router_validation(
+                dataset=calibration_dataset,
+                ratio=router_validation_ratio,
+                seed=_stable_client_seed(config.federated.seed + 7919, client_id),
+            )
             self.client_training_datasets[client_id] = train_dataset
-            self.client_calibration_datasets[client_id] = calibration_dataset
+            self.client_router_train_datasets[client_id] = router_train_dataset
+            self.client_calibration_datasets[client_id] = router_validation_dataset
 
         self.clients: Dict[str, FedAsymClient] = {
             client_id: FedAsymClient(
                 client_id=client_id,
                 train_dataset=self.client_training_datasets[client_id],
-                calibration_dataset=self.client_calibration_datasets[client_id],
+                calibration_dataset=self.client_router_train_datasets[client_id],
+                threshold_dataset=self.client_calibration_datasets[client_id],
                 num_classes=config.model.num_classes,
                 device=config.federated.device,
                 config=config,
@@ -587,6 +763,8 @@ class FedAsymServer(BaseFederatedServer):
         temperature = float(self.config.federated.distill_temperature)
         distill_epochs = max(int(self.config.federated.distill_epochs), 1)
         batch_size = self.config.dataset.batch_size
+        dkdr_center = min(max(float(getattr(self.config.federated, "dkdr_reliability_center", 0.5)), 0.0), 1.0)
+        dkdr_mu = max(float(getattr(self.config.federated, "dkdr_mu", 0.5)), 1e-6)
         sample_reliability_all = public_knowledge.get("sample_reliability")
         if not torch.is_tensor(sample_reliability_all) or sample_reliability_all.numel() != fused_logits_all.size(0):
             fallback_reliability = float(public_knowledge.get("teacher_reliability_mean", 0.5))
@@ -614,8 +792,8 @@ class FedAsymServer(BaseFederatedServer):
                 images = self.public_images_cpu[indices].to(self.device)
                 teacher_logits = fused_logits_all[indices].to(self.device)
                 sample_reliability = sample_reliability_all[indices].to(self.device).clamp(0.0, 1.0)
-                gamma_forward = 1.0 - sample_reliability
-                gamma_reverse = sample_reliability
+                gamma_reverse = torch.sigmoid((sample_reliability - dkdr_center) / dkdr_mu)
+                gamma_forward = 1.0 - gamma_reverse
 
                 optimizer.zero_grad(set_to_none=True)
                 student_logits = self.general_model(images)
@@ -740,6 +918,8 @@ class FedAsymServer(BaseFederatedServer):
         predicted_positive = 0
         true_positive = 0
         actual_positive = 0
+        false_positive = 0
+        actual_negative = 0
 
         with torch.no_grad():
             for client_id, dataset in self.client_test_datasets.items():
@@ -767,6 +947,8 @@ class FedAsymServer(BaseFederatedServer):
                     predicted_positive += int(batch_predicted_positive.sum().item())
                     true_positive += int((batch_predicted_positive & batch_error_labels).sum().item())
                     actual_positive += int(batch_error_labels.sum().item())
+                    false_positive += int((batch_predicted_positive & ~batch_error_labels).sum().item())
+                    actual_negative += int((~batch_error_labels).sum().item())
                     error_labels.extend(batch_error_labels.detach().cpu().to(torch.int64).tolist())
                     error_scores.extend(error_probs.detach().cpu().to(torch.float32).tolist())
 
@@ -774,11 +956,15 @@ class FedAsymServer(BaseFederatedServer):
         recall = true_positive / max(actual_positive, 1)
         f1 = (2.0 * precision * recall) / max(precision + recall, 1e-12)
         auprc = _average_precision_score(error_labels, error_scores)
+        false_positive_rate = false_positive / max(actual_negative, 1)
+        predicted_positive_rate = predicted_positive / max(len(error_labels), 1)
         return {
             "error_predictor_precision": precision,
             "error_predictor_recall": recall,
             "error_predictor_f1": f1,
             "error_predictor_auprc": auprc,
+            "error_predictor_false_positive_rate": false_positive_rate,
+            "error_predictor_predicted_positive_rate": predicted_positive_rate,
         }
 
     def _build_round_extra_metrics(
@@ -827,6 +1013,7 @@ class FedAsymServer(BaseFederatedServer):
             f" | ep_r={extra_metrics.get('error_predictor_recall', 0.0):.4f}"
             f" | ep_f1={extra_metrics.get('error_predictor_f1', 0.0):.4f}"
             f" | ep_auprc={extra_metrics.get('error_predictor_auprc', 0.0):.4f}"
+            f" | ep_fpr={extra_metrics.get('error_predictor_false_positive_rate', 0.0):.4f}"
             f" | dkdr_f={extra_metrics.get('dkdr_forward_kl', 0.0):.4f}"
             f" | dkdr_r={extra_metrics.get('dkdr_reverse_kl', 0.0):.4f}"
             f" | gam_f={extra_metrics.get('dkdr_gamma_forward', 0.5):.4f}"
@@ -951,6 +1138,21 @@ class FedAsymServer(BaseFederatedServer):
             sum(1 for value in updated_thresholds.values() if float(value) > 1.0) / max(len(updated_thresholds), 1),
         )
 
+    def _retrain_route_predictors(self) -> None:
+        updated_thresholds: Dict[str, float] = {}
+        for client_id, client in self.clients.items():
+            predictor_state = client._fit_risk_predictor()
+            client.predictor_state = _clone_tensor_dict(predictor_state)
+            self.client_predictor_states[client_id] = _clone_tensor_dict(predictor_state)
+            updated_thresholds[client_id] = float(client.error_threshold)
+        self.client_error_thresholds = updated_thresholds
+        LOGGER.info(
+            "%s retrained route predictors | mean_threshold=%.4f | veto=%.4f",
+            self.algorithm_name,
+            sum(updated_thresholds.values()) / max(len(updated_thresholds), 1),
+            sum(1 for value in updated_thresholds.values() if float(value) > 1.0) / max(len(updated_thresholds), 1),
+        )
+
     def _restore_best(self) -> None:
         if not self.best_snapshot:
             return
@@ -970,7 +1172,9 @@ class FedAsymServer(BaseFederatedServer):
         checkpoint_path = getattr(self.config.federated, "load_checkpoint_path", None)
         if checkpoint_path and bool(getattr(self.config.federated, "eval_only_from_checkpoint", False)):
             self._load_checkpoint(checkpoint_path)
-            if bool(getattr(self.config.federated, "recalibrate_route_thresholds_on_load", True)):
+            if bool(getattr(self.config.federated, "risk_predictor_retrain_on_load", False)):
+                self._retrain_route_predictors()
+            elif bool(getattr(self.config.federated, "recalibrate_route_thresholds_on_load", True)):
                 self._recalibrate_route_thresholds()
             self.last_history = []
             return []

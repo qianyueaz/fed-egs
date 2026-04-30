@@ -159,6 +159,7 @@ class FederatedConfig:
     calibration_ratio: float = 0.1
     calibration_min_samples: int = 16
     calibration_max_samples: int = 0
+    router_validation_ratio: float = 0.5
     distill_gradient_clip_norm: float = 1.0
     teacher_bank_staleness_decay: float = 0.99
     teacher_bank_max_staleness: int = 0
@@ -167,9 +168,18 @@ class FederatedConfig:
     dkdr_reliability_center: float = 0.5
     dkdr_beta_temperature: float = 0.15
     dkdr_mu: float = 0.5
+    rad_teacher_reliability_beta: float = 2.0
+    rad_route_demand_mode: str = "soft"
+    rad_route_focus_alpha: float = 1.0
+    rad_focus_max: float = 3.0
+    rad_label_correction_gamma: float = 0.5
+    rad_label_correction_max: float = 0.7
     risk_predictor_epochs: int = 40
     risk_predictor_lr: float = 0.05
     risk_predictor_weight_decay: float = 0.0
+    risk_predictor_hidden_dim: int = 32
+    risk_predictor_dropout: float = 0.1
+    risk_predictor_retrain_on_load: bool = False
     route_min_gain: float = 0.0
     route_max_invocation_when_general_worse: float = 0.0
     route_disable_when_no_gain: bool = True
@@ -335,6 +345,8 @@ class InferenceConfig:
     error_predictor_min_predicted_positive: int = 3
     error_predictor_disable_on_precision_fail: bool = True
     error_predictor_high_confidence_guard: float = 1.0
+    error_predictor_use_wilson_lower_bound: bool = False
+    error_predictor_wilson_z: float = 1.96
     routing_error_min_threshold: float = 0.05
     routing_error_max_threshold: float = 0.95
     client_force_general_gap: float = 0.12
@@ -429,6 +441,13 @@ def _resolve_override_target(config: ExperimentConfig, key: str):
         "error_predictor_threshold_mode": (config.inference, "error_predictor_threshold_mode"),
         "error_predictor_target_precision": (config.inference, "error_predictor_target_precision"),
         "error_predictor_high_confidence_guard": (config.inference, "error_predictor_high_confidence_guard"),
+        "error_predictor_use_wilson_lower_bound": (config.inference, "error_predictor_use_wilson_lower_bound"),
+        "calibration_ratio": (config.federated, "calibration_ratio"),
+        "calibration_max_samples": (config.federated, "calibration_max_samples"),
+        "risk_predictor_epochs": (config.federated, "risk_predictor_epochs"),
+        "risk_predictor_lr": (config.federated, "risk_predictor_lr"),
+        "risk_predictor_hidden_dim": (config.federated, "risk_predictor_hidden_dim"),
+        "risk_predictor_retrain_on_load": (config.federated, "risk_predictor_retrain_on_load"),
         "best_checkpoint_path": (config.federated, "best_checkpoint_path"),
         "load_checkpoint_path": (config.federated, "load_checkpoint_path"),
         "eval_only_from_checkpoint": (config.federated, "eval_only_from_checkpoint"),
