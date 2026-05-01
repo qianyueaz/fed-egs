@@ -4,6 +4,7 @@ FedAsym-RAD: router-aware label-corrected server distillation.
 This variant keeps FedAsym's client training, explicit expert-error predictor,
 and inference router unchanged. It only replaces the server-side public
 distillation target:
+  - cached public logits form a cross-client teacher bank,
   - 1 - R_k weights reliable expert teachers,
   - R_k defines where the general model should focus,
   - public labels correct the target when experts are unreliable.
@@ -20,6 +21,7 @@ from fedegs.federated.algorithms.fedasym import (
     FedAsymClientUpdate,
     FedAsymServer,
     _build_error_fallback_mask,
+    _clone_tensor_dict,
     _predict_error_probabilities,
     _predictor_features_from_logits,
 )
@@ -47,17 +49,99 @@ class FedAsymRADServer(FedAsymServer):
         )
         self.algorithm_name = "fedasym_rad"
         self.public_targets_cpu = torch.cat([batch[1] for batch in self.public_batches], dim=0).to(torch.long)
+        self.public_teacher_bank: Dict[str, Dict[str, object]] = {}
+        self.latest_teacher_bank_stats: Dict[str, float] = {
+            "teacher_bank_size": 0.0,
+            "teacher_bank_avg_staleness": 0.0,
+            "teacher_bank_max_staleness": 0.0,
+            "teacher_bank_effective_size": 0.0,
+            "teacher_bank_memory_mb": 0.0,
+        }
+
+    def _empty_public_knowledge(self) -> Dict[str, torch.Tensor | float]:
+        return {
+            "teacher_probs": torch.empty((0, self.config.model.num_classes), dtype=torch.float32),
+            "sample_reliability": torch.empty((0,), dtype=torch.float32),
+            "route_demand": torch.empty((0,), dtype=torch.float32),
+            "teacher_reliability_mean": 0.0,
+            "teacher_error_mean": 0.0,
+            "route_demand_mean": 0.0,
+            **self.latest_teacher_bank_stats,
+        }
+
+    def _update_public_teacher_bank(self, updates: List[FedAsymClientUpdate]) -> None:
+        current_round = int(getattr(self, "current_round", 0))
+        for update in updates:
+            self.public_teacher_bank[update.client_id] = {
+                "public_logits": update.public_logits.detach().cpu().clone(),
+                "predictor_state": _clone_tensor_dict(update.predictor_state),
+                "error_threshold": float(update.error_threshold),
+                "round_idx": current_round,
+            }
+
+    @staticmethod
+    def _teacher_entry_memory_mb(entry: Dict[str, object]) -> float:
+        total_elements = 0
+        public_logits = entry.get("public_logits")
+        if torch.is_tensor(public_logits):
+            total_elements += int(public_logits.numel())
+        predictor_state = entry.get("predictor_state")
+        if isinstance(predictor_state, dict):
+            total_elements += sum(int(value.numel()) for value in predictor_state.values() if torch.is_tensor(value))
+        return total_elements * 4.0 / (1024.0 ** 2)
+
+    def _active_public_teacher_entries(self) -> List[tuple[str, Dict[str, object], int, float]]:
+        current_round = int(getattr(self, "current_round", 0))
+        max_staleness = max(int(getattr(self.config.federated, "teacher_bank_max_staleness", 0)), 0)
+        staleness_decay = min(max(float(getattr(self.config.federated, "teacher_bank_staleness_decay", 0.99)), 0.0), 1.0)
+        active_entries: List[tuple[str, Dict[str, object], int, float]] = []
+        stale_client_ids: List[str] = []
+
+        for client_id, entry in self.public_teacher_bank.items():
+            round_idx = int(entry.get("round_idx", current_round))
+            staleness = max(current_round - round_idx, 0)
+            if max_staleness > 0 and staleness > max_staleness:
+                stale_client_ids.append(client_id)
+                continue
+
+            public_logits = entry.get("public_logits")
+            if not torch.is_tensor(public_logits) or public_logits.size(0) != self.public_images_cpu.size(0):
+                stale_client_ids.append(client_id)
+                continue
+
+            freshness_weight = staleness_decay ** staleness
+            if freshness_weight <= 0.0:
+                continue
+            active_entries.append((client_id, entry, staleness, freshness_weight))
+
+        for client_id in stale_client_ids:
+            self.public_teacher_bank.pop(client_id, None)
+
+        if active_entries:
+            staleness_values = [float(staleness) for _, _, staleness, _ in active_entries]
+            freshness_values = [float(freshness) for _, _, _, freshness in active_entries]
+            self.latest_teacher_bank_stats = {
+                "teacher_bank_size": float(len(active_entries)),
+                "teacher_bank_avg_staleness": sum(staleness_values) / len(staleness_values),
+                "teacher_bank_max_staleness": max(staleness_values),
+                "teacher_bank_effective_size": sum(freshness_values),
+                "teacher_bank_memory_mb": sum(self._teacher_entry_memory_mb(entry) for _, entry, _, _ in active_entries),
+            }
+        else:
+            self.latest_teacher_bank_stats = {
+                "teacher_bank_size": 0.0,
+                "teacher_bank_avg_staleness": 0.0,
+                "teacher_bank_max_staleness": 0.0,
+                "teacher_bank_effective_size": 0.0,
+                "teacher_bank_memory_mb": 0.0,
+            }
+        return active_entries
 
     def _aggregate_public_knowledge(self, updates: List[FedAsymClientUpdate]) -> Dict[str, torch.Tensor | float]:
-        if not updates:
-            return {
-                "teacher_probs": torch.empty((0, self.config.model.num_classes), dtype=torch.float32),
-                "sample_reliability": torch.empty((0,), dtype=torch.float32),
-                "route_demand": torch.empty((0,), dtype=torch.float32),
-                "teacher_reliability_mean": 0.0,
-                "teacher_error_mean": 0.0,
-                "route_demand_mean": 0.0,
-            }
+        self._update_public_teacher_bank(updates)
+        teacher_entries = self._active_public_teacher_entries()
+        if not teacher_entries:
+            return self._empty_public_knowledge()
 
         temperature = float(self.config.federated.distill_temperature)
         reliability_beta = max(float(getattr(self.config.federated, "rad_teacher_reliability_beta", 2.0)), 0.0)
@@ -67,23 +151,28 @@ class FedAsymRADServer(FedAsymServer):
         teacher_weights: List[torch.Tensor] = []
         error_probs_all: List[torch.Tensor] = []
         route_masks: List[torch.Tensor] = []
+        freshness_weights: List[torch.Tensor] = []
 
-        for update in updates:
-            features = _predictor_features_from_logits(update.public_logits)
-            error_probs = _predict_error_probabilities(update.predictor_state, features).detach().cpu().clamp(0.0, 1.0)
+        for _, entry, _, freshness_weight in teacher_entries:
+            public_logits = entry["public_logits"]
+            predictor_state = entry["predictor_state"]
+            features = _predictor_features_from_logits(public_logits)
+            error_probs = _predict_error_probabilities(predictor_state, features).detach().cpu().clamp(0.0, 1.0)
             reliability = (1.0 - error_probs).clamp(1e-4, 1.0)
             weight = reliability.pow(reliability_beta) if reliability_beta != 1.0 else reliability
+            weight = weight * float(freshness_weight)
 
-            teacher_probs.append(F.softmax(update.public_logits / temperature, dim=1).detach().cpu())
+            teacher_probs.append(F.softmax(public_logits / temperature, dim=1).detach().cpu())
             teacher_weights.append(weight)
             error_probs_all.append(error_probs)
+            freshness_weights.append(torch.full_like(error_probs, float(freshness_weight)))
 
             if demand_mode == "hard":
                 route_masks.append(
                     _build_error_fallback_mask(
                         error_probs,
                         features,
-                        float(update.error_threshold),
+                        float(entry["error_threshold"]),
                         self.config,
                     )
                     .to(torch.float32)
@@ -98,12 +187,14 @@ class FedAsymRADServer(FedAsymServer):
         fused_teacher_probs = fused_teacher_probs / fused_teacher_probs.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
         stacked_error_probs = torch.stack(error_probs_all, dim=0)
-        route_demand = (
-            torch.stack(route_masks, dim=0).mean(dim=0)
-            if demand_mode == "hard" and route_masks
-            else stacked_error_probs.mean(dim=0)
-        ).clamp(0.0, 1.0)
-        sample_reliability = (1.0 - stacked_error_probs).mean(dim=0).clamp(0.0, 1.0)
+        stacked_freshness = torch.stack(freshness_weights, dim=0)
+        freshness_denominator = stacked_freshness.sum(dim=0).clamp_min(1e-8)
+        route_source = torch.stack(route_masks, dim=0) if demand_mode == "hard" and route_masks else stacked_error_probs
+        route_demand = ((route_source * stacked_freshness).sum(dim=0) / freshness_denominator).clamp(0.0, 1.0)
+        sample_reliability = (
+            (((1.0 - stacked_error_probs) * stacked_freshness).sum(dim=0) / freshness_denominator)
+            .clamp(0.0, 1.0)
+        )
 
         return {
             "teacher_probs": fused_teacher_probs,
@@ -112,6 +203,7 @@ class FedAsymRADServer(FedAsymServer):
             "teacher_reliability_mean": float(sample_reliability.mean().item()),
             "teacher_error_mean": float((1.0 - sample_reliability).mean().item()),
             "route_demand_mean": float(route_demand.mean().item()),
+            **self.latest_teacher_bank_stats,
         }
 
     def _distill_general_model(
@@ -134,6 +226,11 @@ class FedAsymRADServer(FedAsymServer):
                 "route_demand_mean": float(public_knowledge.get("route_demand_mean", 0.0)),
                 "label_ce_weight": 0.0,
                 "focus_weight": 1.0,
+                "teacher_bank_size": float(public_knowledge.get("teacher_bank_size", 0.0)),
+                "teacher_bank_avg_staleness": float(public_knowledge.get("teacher_bank_avg_staleness", 0.0)),
+                "teacher_bank_max_staleness": float(public_knowledge.get("teacher_bank_max_staleness", 0.0)),
+                "teacher_bank_effective_size": float(public_knowledge.get("teacher_bank_effective_size", 0.0)),
+                "teacher_bank_memory_mb": float(public_knowledge.get("teacher_bank_memory_mb", 0.0)),
             }
             return dict(self.latest_distill_stats)
 
@@ -259,6 +356,11 @@ class FedAsymRADServer(FedAsymServer):
             "route_demand_mean": total_route_demand / divisor,
             "label_ce_weight": total_label_ce_weight / divisor,
             "focus_weight": total_focus_weight / divisor,
+            "teacher_bank_size": float(public_knowledge.get("teacher_bank_size", 0.0)),
+            "teacher_bank_avg_staleness": float(public_knowledge.get("teacher_bank_avg_staleness", 0.0)),
+            "teacher_bank_max_staleness": float(public_knowledge.get("teacher_bank_max_staleness", 0.0)),
+            "teacher_bank_effective_size": float(public_knowledge.get("teacher_bank_effective_size", 0.0)),
+            "teacher_bank_memory_mb": float(public_knowledge.get("teacher_bank_memory_mb", 0.0)),
         }
         return dict(self.latest_distill_stats)
 
@@ -271,6 +373,11 @@ class FedAsymRADServer(FedAsymServer):
                 "rad_focus_weight": self.latest_distill_stats.get("focus_weight", 1.0),
                 "distill_kd_loss": self.latest_distill_stats.get("kd_loss", 0.0),
                 "distill_ce_loss": self.latest_distill_stats.get("label_ce_loss", 0.0),
+                "teacher_bank_size": self.latest_distill_stats.get("teacher_bank_size", 0.0),
+                "teacher_bank_avg_staleness": self.latest_distill_stats.get("teacher_bank_avg_staleness", 0.0),
+                "teacher_bank_max_staleness": self.latest_distill_stats.get("teacher_bank_max_staleness", 0.0),
+                "teacher_bank_effective_size": self.latest_distill_stats.get("teacher_bank_effective_size", 0.0),
+                "teacher_bank_memory_mb": self.latest_distill_stats.get("teacher_bank_memory_mb", 0.0),
             }
         )
         return metrics
@@ -283,4 +390,6 @@ class FedAsymRADServer(FedAsymServer):
             f" | rad_cew={extra_metrics.get('rad_label_ce_weight', 0.0):.4f}"
             f" | rad_fw={extra_metrics.get('rad_focus_weight', 1.0):.4f}"
             f" | rad_ce={extra_metrics.get('distill_ce_loss', 0.0):.4f}"
+            f" | bank={extra_metrics.get('teacher_bank_size', 0.0):.0f}"
+            f" | stale={extra_metrics.get('teacher_bank_avg_staleness', 0.0):.2f}"
         )

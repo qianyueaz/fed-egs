@@ -291,7 +291,7 @@ def _select_precision_constrained_threshold(
 ) -> float:
     base_threshold = float(getattr(config.inference, "error_predictor_threshold", 0.5))
     mode = str(getattr(config.inference, "error_predictor_threshold_mode", "fixed")).lower()
-    if mode not in {"precision", "precision_constrained"}:
+    if mode not in {"precision", "precision_constrained", "precision_wilson", "wilson"}:
         return base_threshold
 
     target_precision = min(max(float(getattr(config.inference, "error_predictor_target_precision", 0.8)), 0.0), 1.0)
@@ -699,6 +699,8 @@ class FedAsymServer(BaseFederatedServer):
             client_id: float(getattr(config.inference, "error_predictor_threshold", 0.5))
             for client_id in client_datasets
         }
+        self.client_raw_error_thresholds: Dict[str, float] = dict(self.client_error_thresholds)
+        self.client_route_gain_stats: Dict[str, Dict[str, float]] = {}
         self.last_history: List[RoundMetrics] = []
         self.best_snapshot: Optional[Dict[str, object]] = None
         self.loaded_checkpoint_path: Optional[str] = None
@@ -897,6 +899,174 @@ class FedAsymServer(BaseFederatedServer):
     def _predict_routed_full_metadata(self, client_id, images, indices):
         return self._predict_routed_impl(client_id, images, indices, full_metadata=True)
 
+    def _route_gain_filter_enabled(self) -> bool:
+        return bool(getattr(self.config.federated, "route_disable_when_no_gain", False))
+
+    def _calibrate_client_route_gain(self, client_id: str, threshold: float) -> Tuple[float, Dict[str, float]]:
+        threshold = float(threshold)
+        stats: Dict[str, float] = {
+            "raw_threshold": threshold,
+            "filtered_threshold": threshold,
+            "disabled_by_gain": 0.0,
+            "disabled_by_min_invoked": 0.0,
+            "disabled_by_min_gain": 0.0,
+            "disabled_by_nonpositive_net": 0.0,
+            "samples": 0.0,
+            "invoked": 0.0,
+            "invocation_rate": 0.0,
+            "expert_acc": 0.0,
+            "routed_acc": 0.0,
+            "route_gain": 0.0,
+            "rescue": 0.0,
+            "harm": 0.0,
+            "net_rescue": 0.0,
+        }
+        if not self._route_gain_filter_enabled() or threshold > 1.0:
+            return threshold, stats
+
+        dataset = self.client_calibration_datasets.get(client_id)
+        if dataset is None or len(dataset) == 0:
+            return threshold, stats
+
+        predictor_state = self.client_predictor_states[client_id]
+        expert_model = self.clients[client_id].expert_model
+        expert_model.eval()
+        self.general_model.eval()
+
+        total = 0
+        invoked = 0
+        expert_correct_total = 0
+        routed_correct_total = 0
+        rescue = 0
+        harm = 0
+        loader = self.data_module.make_loader(dataset, shuffle=False)
+        with torch.no_grad():
+            for images, targets, _ in loader:
+                images = images.to(self.device)
+                targets_device = targets.to(self.device)
+
+                expert_logits = expert_model(images)
+                expert_features = _predictor_features_from_logits(expert_logits)
+                error_probs = _predict_error_probabilities(predictor_state, expert_features)
+                fallback_mask = _build_error_fallback_mask(error_probs, expert_features, threshold, self.config)
+                expert_correct = expert_logits.argmax(dim=1).eq(targets_device)
+                routed_correct = expert_correct.clone()
+
+                if fallback_mask.any():
+                    general_logits = self.general_model(images[fallback_mask])
+                    general_correct = general_logits.argmax(dim=1).eq(targets_device[fallback_mask])
+                    routed_correct[fallback_mask] = general_correct
+                    expert_fallback_correct = expert_correct[fallback_mask]
+                    rescue += int((~expert_fallback_correct & general_correct).sum().item())
+                    harm += int((expert_fallback_correct & ~general_correct).sum().item())
+
+                total += int(images.size(0))
+                invoked += int(fallback_mask.sum().item())
+                expert_correct_total += int(expert_correct.sum().item())
+                routed_correct_total += int(routed_correct.sum().item())
+
+        expert_acc = expert_correct_total / max(total, 1)
+        routed_acc = routed_correct_total / max(total, 1)
+        route_gain = routed_acc - expert_acc
+        stats.update(
+            {
+                "samples": float(total),
+                "invoked": float(invoked),
+                "invocation_rate": float(invoked / max(total, 1)),
+                "expert_acc": float(expert_acc),
+                "routed_acc": float(routed_acc),
+                "route_gain": float(route_gain),
+                "rescue": float(rescue),
+                "harm": float(harm),
+                "net_rescue": float(rescue - harm),
+            }
+        )
+
+        min_gain = float(getattr(self.config.federated, "route_min_gain", 0.0))
+        default_min_invoked = int(getattr(self.config.inference, "error_predictor_min_predicted_positive", 3))
+        min_invoked = max(int(getattr(self.config.federated, "route_gain_filter_min_invoked", default_min_invoked)), 1)
+        require_positive_net = bool(getattr(self.config.federated, "route_gain_filter_require_positive_net", True))
+        net_rescue = rescue - harm
+        min_invoked_fail = invoked < min_invoked
+        min_gain_fail = route_gain <= min_gain
+        nonpositive_net_fail = require_positive_net and net_rescue <= 0
+        if min_invoked_fail or min_gain_fail or nonpositive_net_fail:
+            stats["disabled_by_gain"] = 1.0
+            stats["disabled_by_min_invoked"] = float(min_invoked_fail)
+            stats["disabled_by_min_gain"] = float(min_gain_fail)
+            stats["disabled_by_nonpositive_net"] = float(nonpositive_net_fail)
+            stats["filtered_threshold"] = 1.01
+            return 1.01, stats
+
+        return threshold, stats
+
+    def _log_route_gain_filter_details(self, context: str, client_ids: Optional[Sequence[str]] = None) -> None:
+        if not self._route_gain_filter_enabled() or not self.client_route_gain_stats:
+            return
+        target_client_ids = list(client_ids) if client_ids is not None else sorted(self.client_route_gain_stats.keys())
+        for client_id in target_client_ids:
+            stats = self.client_route_gain_stats.get(client_id)
+            if not stats:
+                continue
+            LOGGER.info(
+                "%s route gain filter %s client=%s"
+                " | raw_thr=%.4f | final_thr=%.4f | disabled=%d"
+                " | min_invoked_fail=%d | min_gain_fail=%d | nonpositive_net_fail=%d"
+                " | n=%d | invoke=%d | invoke_rate=%.4f"
+                " | expert_acc=%.4f | routed_acc=%.4f | gain=%.4f"
+                " | rescue=%d | harm=%d | net=%d",
+                self.algorithm_name,
+                context,
+                client_id,
+                float(stats.get("raw_threshold", 0.0)),
+                float(stats.get("filtered_threshold", 0.0)),
+                int(stats.get("disabled_by_gain", 0.0) > 0.0),
+                int(stats.get("disabled_by_min_invoked", 0.0) > 0.0),
+                int(stats.get("disabled_by_min_gain", 0.0) > 0.0),
+                int(stats.get("disabled_by_nonpositive_net", 0.0) > 0.0),
+                int(stats.get("samples", 0.0)),
+                int(stats.get("invoked", 0.0)),
+                float(stats.get("invocation_rate", 0.0)),
+                float(stats.get("expert_acc", 0.0)),
+                float(stats.get("routed_acc", 0.0)),
+                float(stats.get("route_gain", 0.0)),
+                int(stats.get("rescue", 0.0)),
+                int(stats.get("harm", 0.0)),
+                int(stats.get("net_rescue", 0.0)),
+            )
+
+    def _apply_route_gain_filter_to_thresholds(self, client_ids: Optional[Sequence[str]] = None) -> None:
+        if not self._route_gain_filter_enabled():
+            return
+        target_client_ids = list(client_ids) if client_ids is not None else list(self.clients.keys())
+        disabled = 0
+        gains: List[float] = []
+        for client_id in target_client_ids:
+            raw_threshold = float(
+                self.client_raw_error_thresholds.get(
+                    client_id,
+                    self.client_error_thresholds.get(
+                        client_id,
+                        getattr(self.config.inference, "error_predictor_threshold", 0.5),
+                    ),
+                )
+            )
+            filtered_threshold, stats = self._calibrate_client_route_gain(client_id, raw_threshold)
+            self.client_error_thresholds[client_id] = filtered_threshold
+            self.client_route_gain_stats[client_id] = stats
+            disabled += int(stats.get("disabled_by_gain", 0.0) > 0.0)
+            if stats.get("samples", 0.0) > 0.0:
+                gains.append(float(stats.get("route_gain", 0.0)))
+
+        if target_client_ids:
+            LOGGER.info(
+                "%s route gain filter | clients=%d | disabled=%d | mean_gain=%.4f",
+                self.algorithm_name,
+                len(target_client_ids),
+                disabled,
+                sum(gains) / max(len(gains), 1),
+            )
+
     def _evaluate_route_effectiveness_metrics(
         self,
         expert_eval: Dict[str, object],
@@ -986,6 +1156,25 @@ class FedAsymServer(BaseFederatedServer):
             if self.client_error_thresholds
             else 0.0
         )
+        gain_filter_stats = list(self.client_route_gain_stats.values())
+        gain_filter_disabled_rate = (
+            sum(1 for item in gain_filter_stats if item.get("disabled_by_gain", 0.0) > 0.0)
+            / max(len(gain_filter_stats), 1)
+            if gain_filter_stats
+            else 0.0
+        )
+        gain_filter_mean_gain = (
+            sum(float(item.get("route_gain", 0.0)) for item in gain_filter_stats)
+            / max(len(gain_filter_stats), 1)
+            if gain_filter_stats
+            else 0.0
+        )
+        gain_filter_mean_invocation = (
+            sum(float(item.get("invoked", 0.0)) / max(float(item.get("samples", 0.0)), 1.0) for item in gain_filter_stats)
+            / max(len(gain_filter_stats), 1)
+            if gain_filter_stats
+            else 0.0
+        )
         metrics.update(
             {
                 **predictor_metrics,
@@ -998,6 +1187,9 @@ class FedAsymServer(BaseFederatedServer):
                 "teacher_error_mean": self.latest_distill_stats.get("teacher_error_mean", 0.0),
                 "routing_error_threshold_mean": threshold_mean,
                 "routing_client_veto_rate": veto_rate,
+                "route_gain_filter_disabled_rate": gain_filter_disabled_rate,
+                "route_gain_filter_mean_gain": gain_filter_mean_gain,
+                "route_gain_filter_mean_invocation_rate": gain_filter_mean_invocation,
             }
         )
         return metrics
@@ -1014,6 +1206,9 @@ class FedAsymServer(BaseFederatedServer):
             f" | ep_f1={extra_metrics.get('error_predictor_f1', 0.0):.4f}"
             f" | ep_auprc={extra_metrics.get('error_predictor_auprc', 0.0):.4f}"
             f" | ep_fpr={extra_metrics.get('error_predictor_false_positive_rate', 0.0):.4f}"
+            f" | ep_pos={extra_metrics.get('error_predictor_predicted_positive_rate', 0.0):.4f}"
+            f" | rgf_disable={extra_metrics.get('route_gain_filter_disabled_rate', 0.0):.4f}"
+            f" | rgf_gain={extra_metrics.get('route_gain_filter_mean_gain', 0.0):.4f}"
             f" | dkdr_f={extra_metrics.get('dkdr_forward_kl', 0.0):.4f}"
             f" | dkdr_r={extra_metrics.get('dkdr_reverse_kl', 0.0):.4f}"
             f" | gam_f={extra_metrics.get('dkdr_gamma_forward', 0.5):.4f}"
@@ -1041,6 +1236,7 @@ class FedAsymServer(BaseFederatedServer):
                 client_id: _clone_tensor_dict(state) for client_id, state in self.client_predictor_states.items()
             },
             "client_error_thresholds": dict(self.client_error_thresholds),
+            "client_raw_error_thresholds": dict(self.client_raw_error_thresholds),
             "latest_distill_stats": dict(self.latest_distill_stats),
         }
         LOGGER.info(
@@ -1123,12 +1319,15 @@ class FedAsymServer(BaseFederatedServer):
                 features = torch.cat(feature_batches, dim=0)
                 labels = torch.cat(label_batches, dim=0)
                 scores = _predict_error_probabilities(predictor_state, features)
-                updated_thresholds[client_id] = _select_precision_constrained_threshold(
+                raw_threshold = _select_precision_constrained_threshold(
                     scores=scores,
                     labels=labels,
                     features=features,
                     config=self.config,
                 )
+                self.client_raw_error_thresholds[client_id] = raw_threshold
+                updated_thresholds[client_id], stats = self._calibrate_client_route_gain(client_id, raw_threshold)
+                self.client_route_gain_stats[client_id] = stats
 
         self.client_error_thresholds = updated_thresholds
         LOGGER.info(
@@ -1137,6 +1336,7 @@ class FedAsymServer(BaseFederatedServer):
             sum(updated_thresholds.values()) / max(len(updated_thresholds), 1),
             sum(1 for value in updated_thresholds.values() if float(value) > 1.0) / max(len(updated_thresholds), 1),
         )
+        self._log_route_gain_filter_details("recalibrate")
 
     def _retrain_route_predictors(self) -> None:
         updated_thresholds: Dict[str, float] = {}
@@ -1144,7 +1344,10 @@ class FedAsymServer(BaseFederatedServer):
             predictor_state = client._fit_risk_predictor()
             client.predictor_state = _clone_tensor_dict(predictor_state)
             self.client_predictor_states[client_id] = _clone_tensor_dict(predictor_state)
-            updated_thresholds[client_id] = float(client.error_threshold)
+            raw_threshold = float(client.error_threshold)
+            self.client_raw_error_thresholds[client_id] = raw_threshold
+            updated_thresholds[client_id], stats = self._calibrate_client_route_gain(client_id, raw_threshold)
+            self.client_route_gain_stats[client_id] = stats
         self.client_error_thresholds = updated_thresholds
         LOGGER.info(
             "%s retrained route predictors | mean_threshold=%.4f | veto=%.4f",
@@ -1152,6 +1355,7 @@ class FedAsymServer(BaseFederatedServer):
             sum(updated_thresholds.values()) / max(len(updated_thresholds), 1),
             sum(1 for value in updated_thresholds.values() if float(value) > 1.0) / max(len(updated_thresholds), 1),
         )
+        self._log_route_gain_filter_details("retrain")
 
     def _restore_best(self) -> None:
         if not self.best_snapshot:
@@ -1164,6 +1368,10 @@ class FedAsymServer(BaseFederatedServer):
             for client_id, state in self.best_snapshot["client_predictor_states"].items()
         }
         self.client_error_thresholds = dict(self.best_snapshot["client_error_thresholds"])
+        self.client_raw_error_thresholds = dict(
+            self.best_snapshot.get("client_raw_error_thresholds", self.client_error_thresholds)
+        )
+        self.client_route_gain_stats = {}
         self.latest_distill_stats = dict(self.best_snapshot.get("latest_distill_stats", {}))
         self.current_round = int(self.best_snapshot["round_idx"])
         LOGGER.info("%s restored best from round %d", self.algorithm_name, self.best_snapshot["round_idx"])
@@ -1198,10 +1406,12 @@ class FedAsymServer(BaseFederatedServer):
             ]
             for update in updates:
                 self.client_predictor_states[update.client_id] = _clone_tensor_dict(update.predictor_state)
+                self.client_raw_error_thresholds[update.client_id] = float(update.error_threshold)
                 self.client_error_thresholds[update.client_id] = float(update.error_threshold)
 
             public_knowledge = self._aggregate_public_knowledge(updates)
             distill_stats = self._distill_general_model(public_knowledge, round_idx)
+            self._apply_route_gain_filter_to_thresholds()
 
             expert_eval = self._evaluate_predictor_on_client_tests(self._predict_expert_only, f"{self.algorithm_name}-expert")
             general_eval = self._evaluate_predictor_on_client_tests(self._predict_general_only, f"{self.algorithm_name}-general")

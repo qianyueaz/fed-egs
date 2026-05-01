@@ -5,6 +5,7 @@ from fedegs.federated.algorithms.pfedfda import PFedFDAServer
 from fedegs.federated.algorithms.fedegs import FedEGSServer
 from fedegs.federated.algorithms.fedasym import FedAsymServer
 from fedegs.federated.algorithms.fedasym_gain import FedAsymGainServer
+from fedegs.federated.algorithms.fedasym_rad import FedAsymRADServer
 from fedegs.federated.algorithms.fedegs2 import FedEGS2Server
 from fedegs.federated.algorithms.fedegsbg import FedEGSBGServer
 from fedegs.federated.algorithms.fedegsba import FedEGSBAServer
@@ -30,6 +31,8 @@ def create_federated_server(name: str, config, client_datasets, client_test_data
         return FedAsymServer(config, client_datasets, client_test_datasets, data_module, test_hard_indices, writer, public_dataset=public_dataset)
     if normalized in {"fedasym_gain", "fedasym-gain", "fedasymgain"}:
         return FedAsymGainServer(config, client_datasets, client_test_datasets, data_module, test_hard_indices, writer, public_dataset=public_dataset)
+    if normalized in {"fedasym_rad", "fedasym-rad", "fedasymrad", "fedasym_srpd", "fedasym-srpd"}:
+        return FedAsymRADServer(config, client_datasets, client_test_datasets, data_module, test_hard_indices, writer, public_dataset=public_dataset)
     if normalized in {"fedegsd", "fedegs-d", "fedegs_d"}:
         return FedEGSDServer(config, client_datasets, client_test_datasets, data_module, test_hard_indices, writer, public_dataset=public_dataset)
     if normalized in {"fedegsd-s", "fedegsd_s", "fedegsds"}:

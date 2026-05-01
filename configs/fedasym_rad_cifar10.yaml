@@ -56,6 +56,8 @@ federated:
   risk_predictor_retrain_on_load: false
 
   dkdr_mu: 0.50
+  teacher_bank_staleness_decay: 0.99
+  teacher_bank_max_staleness: 0
   rad_teacher_reliability_beta: 2.0
   rad_route_demand_mode: soft
   rad_route_focus_alpha: 1.0

@@ -15,6 +15,7 @@ KNOWN_ALGORITHMS = {
     "fedegsbg",
     "fedasym",
     "fedasym_gain",
+    "fedasym_rad",
     "fedegsd",
     "fedegsd_s",
     "fedegse",
@@ -106,6 +107,15 @@ class FederatedSummaryWriter:
             "distill_loss",
             "distill_kd_loss",
             "distill_ce_loss",
+            "error_predictor_precision",
+            "error_predictor_recall",
+            "error_predictor_f1",
+            "error_predictor_auprc",
+            "error_predictor_false_positive_rate",
+            "error_predictor_predicted_positive_rate",
+            "rad_route_demand",
+            "rad_label_ce_weight",
+            "rad_focus_weight",
             "distill_alpha_mean",
             "teacher_bank_size",
             "teacher_bank_avg_staleness",
@@ -146,76 +156,6 @@ class FederatedSummaryWriter:
             "routing_regret",
             "expert_general_disagreement_rate",
         ]
-        summary_metrics = [
-            "accuracy",
-            "routed_accuracy",
-            "weighted_accuracy",
-            "hard_accuracy",
-            "invocation_rate",
-            "compute_savings",
-            "client_train_flops",
-            "client_train_flops_total",
-            "expert_infer_flops",
-            "general_infer_flops",
-            "routed_infer_flops",
-            "expert_train_memory_mb",
-            "expert_infer_memory_mb",
-            "general_train_memory_mb",
-            "general_infer_memory_mb",
-            "expert_train_peak_memory_mb",
-            "expert_infer_peak_memory_mb",
-            "general_train_peak_memory_mb",
-            "general_infer_peak_memory_mb",
-            "inference_latency_ms",
-            "average_round_train_time_seconds",
-            "total_train_time_seconds",
-            "average_upload_bytes_per_round",
-            "total_upload_bytes",
-            "expert_only_accuracy",
-            "general_only_accuracy",
-            "final_training_loss",
-            "distill_loss",
-            "distill_kd_loss",
-            "distill_ce_loss",
-            "distill_alpha_mean",
-            "teacher_bank_size",
-            "teacher_bank_avg_staleness",
-            "teacher_bank_max_staleness",
-            "teacher_bank_memory_mb",
-            "teacher_bank_effective_size",
-            "teacher_weight_max_share",
-            "teacher_confidence_mean",
-            "teacher_entropy_mean",
-            "selected_teacher_count_mean",
-            "selected_teacher_coverage",
-            "teacher_topk_selected_mean",
-            "teacher_selected_coverage",
-            "ema_kd_loss",
-            "fallback_weight_mean",
-            "fallback_weight_invoked_mean",
-            "fallback_weight_noninvoked_mean",
-            "proxy_fallback_ratio",
-            "proxy_fallback_target_ratio",
-            "proxy_teacher_disagreement_mean",
-            "proxy_route_score_mean",
-            "proxy_route_score_invoked_mean",
-            "proxy_expert_confidence_invoked_mean",
-            "routing_general_reliability_threshold",
-            "routing_general_route_enabled_rate",
-            "routing_holdout_general_reliability",
-            "routing_invoked_general_reliability",
-            "latest_real_invocation_rate",
-            "general_gain_over_expert",
-            "routed_gain_over_expert",
-            "invoked_general_accuracy",
-            "invoked_expert_accuracy",
-            "invoked_general_gain",
-            "oracle_route_accuracy",
-            "oracle_general_invocation_rate",
-            "expert_bad_general_good_rate",
-            "routing_regret",
-            "expert_general_disagreement_rate",
-        ]
         layout = {
             "Compare": {
                 metric_name: [
@@ -223,13 +163,6 @@ class FederatedSummaryWriter:
                     [f"compare_group/{metric_name}/{algorithm}" for algorithm in sorted(KNOWN_ALGORITHMS)],
                 ]
                 for metric_name in compare_metrics
-            },
-            "Summary": {
-                metric_name: [
-                    "Multiline",
-                    [f"summary_group/{metric_name}/{algorithm}" for algorithm in sorted(KNOWN_ALGORITHMS)],
-                ]
-                for metric_name in summary_metrics
             },
         }
         self.root_writer.add_custom_scalars(layout)
@@ -255,10 +188,6 @@ class FederatedSummaryWriter:
     def add_compare_scalar(self, algorithm: str, metric_name: str, value: float, step: int) -> None:
         self._get_algorithm_writer(algorithm).add_scalar(f"compare/{metric_name}", value, step)
         self.root_writer.add_scalar(f"compare_group/{metric_name}/{_sanitize_run_name(algorithm)}", value, step)
-
-    def add_summary_scalar(self, algorithm: str, metric_name: str, value: float, step: int) -> None:
-        self._get_algorithm_writer(algorithm).add_scalar(f"summary/{metric_name}", value, step)
-        self.root_writer.add_scalar(f"summary_group/{metric_name}/{_sanitize_run_name(algorithm)}", value, step)
 
     def add_algorithm_scalar(self, algorithm: str, metric_tag: str, value: float, step: int) -> None:
         self._get_algorithm_writer(algorithm).add_scalar(metric_tag, value, step)

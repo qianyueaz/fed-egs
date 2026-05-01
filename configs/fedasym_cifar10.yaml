@@ -54,6 +54,10 @@ federated:
   risk_predictor_hidden_dim: 32
   risk_predictor_dropout: 0.10
   risk_predictor_retrain_on_load: false
+  route_disable_when_no_gain: true
+  route_min_gain: 0.0
+  route_gain_filter_min_invoked: 10
+  route_gain_filter_require_positive_net: true
 
   dkdr_mu: 0.50
   general_pretrain_imagenet_init: false
@@ -77,4 +81,5 @@ inference:
   error_predictor_min_predicted_positive: 3
   error_predictor_disable_on_precision_fail: true
   error_predictor_use_wilson_lower_bound: false
+  error_predictor_wilson_z: 1.96
   error_predictor_high_confidence_guard: 0.95

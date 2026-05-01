@@ -181,6 +181,8 @@ class FederatedConfig:
     risk_predictor_dropout: float = 0.1
     risk_predictor_retrain_on_load: bool = False
     route_min_gain: float = 0.0
+    route_gain_filter_min_invoked: int = 10
+    route_gain_filter_require_positive_net: bool = True
     route_max_invocation_when_general_worse: float = 0.0
     route_disable_when_no_gain: bool = True
     fedasym_best_metric: str = "auto"
@@ -440,14 +442,23 @@ def _resolve_override_target(config: ExperimentConfig, key: str):
         "error_predictor_threshold": (config.inference, "error_predictor_threshold"),
         "error_predictor_threshold_mode": (config.inference, "error_predictor_threshold_mode"),
         "error_predictor_target_precision": (config.inference, "error_predictor_target_precision"),
+        "error_predictor_min_predicted_positive": (config.inference, "error_predictor_min_predicted_positive"),
+        "error_predictor_disable_on_precision_fail": (config.inference, "error_predictor_disable_on_precision_fail"),
         "error_predictor_high_confidence_guard": (config.inference, "error_predictor_high_confidence_guard"),
         "error_predictor_use_wilson_lower_bound": (config.inference, "error_predictor_use_wilson_lower_bound"),
+        "error_predictor_wilson_z": (config.inference, "error_predictor_wilson_z"),
         "calibration_ratio": (config.federated, "calibration_ratio"),
         "calibration_max_samples": (config.federated, "calibration_max_samples"),
+        "router_validation_ratio": (config.federated, "router_validation_ratio"),
         "risk_predictor_epochs": (config.federated, "risk_predictor_epochs"),
         "risk_predictor_lr": (config.federated, "risk_predictor_lr"),
         "risk_predictor_hidden_dim": (config.federated, "risk_predictor_hidden_dim"),
+        "risk_predictor_dropout": (config.federated, "risk_predictor_dropout"),
         "risk_predictor_retrain_on_load": (config.federated, "risk_predictor_retrain_on_load"),
+        "route_min_gain": (config.federated, "route_min_gain"),
+        "route_gain_filter_min_invoked": (config.federated, "route_gain_filter_min_invoked"),
+        "route_gain_filter_require_positive_net": (config.federated, "route_gain_filter_require_positive_net"),
+        "route_disable_when_no_gain": (config.federated, "route_disable_when_no_gain"),
         "best_checkpoint_path": (config.federated, "best_checkpoint_path"),
         "load_checkpoint_path": (config.federated, "load_checkpoint_path"),
         "eval_only_from_checkpoint": (config.federated, "eval_only_from_checkpoint"),

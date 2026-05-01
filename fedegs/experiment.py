@@ -1,8 +1,12 @@
 import copy
+import logging
 from dataclasses import asdict
 from typing import Dict, List, Tuple
 
 from fedegs.federated import create_federated_server
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 SUMMARY_METRIC_ALIASES = [
@@ -87,6 +91,45 @@ SUMMARY_METRIC_ALIASES = [
 ]
 
 
+def _summary_metric_values(metrics: Dict[str, object]) -> Dict[str, float]:
+    values: Dict[str, float] = {}
+    for summary_metric, aliases in SUMMARY_METRIC_ALIASES:
+        for alias in aliases:
+            if alias not in metrics:
+                continue
+            value = metrics[alias]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            values[summary_metric] = float(value)
+            break
+    return values
+
+
+def _scalar_metric_values(metrics: Dict[str, object]) -> Dict[str, float]:
+    values: Dict[str, float] = {}
+    for metric_name, value in metrics.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        values[str(metric_name)] = float(value)
+    return values
+
+
+def _log_final_metrics(algorithm: str, metrics: Dict[str, object]) -> None:
+    summary_values = _summary_metric_values(metrics)
+    scalar_values = _scalar_metric_values(metrics)
+    if not summary_values and not scalar_values:
+        LOGGER.info("%s final metrics | none", algorithm)
+        return
+    LOGGER.info("%s final metrics begin", algorithm)
+    for metric_name in sorted(summary_values):
+        LOGGER.info("%s final tensorboard_metric | %s=%.10g", algorithm, metric_name, summary_values[metric_name])
+    for metric_name in sorted(scalar_values):
+        if metric_name in summary_values:
+            continue
+        LOGGER.info("%s final metric | %s=%.10g", algorithm, metric_name, scalar_values[metric_name])
+    LOGGER.info("%s final metrics end", algorithm)
+
+
 def run_experiment_suite(config, data_bundle, data_module, writer=None) -> Tuple[List[object], Dict[str, object]]:
     primary_history, primary_result = _run_single_algorithm(
         algorithm_name=config.federated.server_algorithm,
@@ -145,18 +188,5 @@ def _run_single_algorithm(algorithm_name: str, config, data_bundle, data_module,
         result["algorithm"] = "ideal"
     result["history"] = [{"round": item.round_idx, **asdict(item)} for item in history]
 
-    if writer is not None:
-        metrics = result.get("metrics", {})
-        summary_step = 0
-        summary_prefix = result.get("algorithm", normalized)
-        for summary_metric, aliases in SUMMARY_METRIC_ALIASES:
-            for alias in aliases:
-                if alias not in metrics:
-                    continue
-                value = metrics[alias]
-                if hasattr(writer, "add_summary_scalar"):
-                    writer.add_summary_scalar(summary_prefix, summary_metric, value, summary_step)
-                else:
-                    writer.add_scalar(f"summary/{summary_metric}/{summary_prefix}", value, summary_step)
-                break
+    _log_final_metrics(result.get("algorithm", normalized), result.get("metrics", {}))
     return history, result
