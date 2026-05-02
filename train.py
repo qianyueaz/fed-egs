@@ -42,11 +42,16 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--error-predictor-threshold", dest="error_predictor_threshold", type=float, default=None)
     parser.add_argument("--error-predictor-threshold-mode", dest="error_predictor_threshold_mode", default=None)
     parser.add_argument("--error-predictor-target-precision", dest="error_predictor_target_precision", type=float, default=None)
+    parser.add_argument("--error-predictor-target-fpr", dest="error_predictor_target_fpr", type=float, default=None)
+    parser.add_argument("--error-predictor-max-false-positive", dest="error_predictor_max_false_positive", type=int, default=None)
     parser.add_argument("--error-predictor-min-predicted-positive", dest="error_predictor_min_predicted_positive", type=int, default=None)
     parser.add_argument("--allow-error-predictor-precision-fail", dest="error_predictor_disable_on_precision_fail", action="store_false")
     parser.add_argument("--error-predictor-high-confidence-guard", dest="error_predictor_high_confidence_guard", type=float, default=None)
     parser.add_argument("--error-predictor-use-wilson", dest="error_predictor_use_wilson_lower_bound", action="store_true")
     parser.add_argument("--error-predictor-wilson-z", dest="error_predictor_wilson_z", type=float, default=None)
+    parser.add_argument("--router-diagnostics", dest="router_diagnostics_enabled", action="store_true")
+    parser.add_argument("--router-diagnostics-min-samples", dest="router_diagnostics_min_samples", type=int, default=None)
+    parser.add_argument("--disable-router-diagnostics-classes", dest="router_diagnostics_include_classes", action="store_false")
     parser.add_argument("--calibration-ratio", dest="calibration_ratio", type=float, default=None)
     parser.add_argument("--calibration-max-samples", dest="calibration_max_samples", type=int, default=None)
     parser.add_argument("--router-validation-ratio", dest="router_validation_ratio", type=float, default=None)
@@ -54,10 +59,61 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--risk-predictor-lr", dest="risk_predictor_lr", type=float, default=None)
     parser.add_argument("--risk-predictor-hidden-dim", dest="risk_predictor_hidden_dim", type=int, default=None)
     parser.add_argument("--risk-predictor-dropout", dest="risk_predictor_dropout", type=float, default=None)
+    parser.add_argument("--risk-predictor-hard-negative", dest="risk_predictor_hard_negative_enabled", action="store_true")
+    parser.add_argument(
+        "--disable-risk-predictor-hard-negative",
+        dest="risk_predictor_hard_negative_enabled",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--risk-predictor-hard-negative-quantile",
+        dest="risk_predictor_hard_negative_quantile",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--risk-predictor-hard-negative-weight",
+        dest="risk_predictor_hard_negative_weight",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--risk-predictor-hard-negative-warmup-epochs",
+        dest="risk_predictor_hard_negative_warmup_epochs",
+        type=int,
+        default=None,
+    )
     parser.add_argument("--route-min-gain", dest="route_min_gain", type=float, default=None)
     parser.add_argument("--route-gain-filter-min-invoked", dest="route_gain_filter_min_invoked", type=int, default=None)
     parser.add_argument("--allow-route-gain-filter-nonpositive-net", dest="route_gain_filter_require_positive_net", action="store_false")
     parser.add_argument("--disable-route-gain-filter", dest="route_disable_when_no_gain", action="store_false")
+    parser.add_argument("--router-group-mode", dest="router_group_mode", default=None)
+    parser.add_argument("--router-group-filter-strategy", dest="router_group_filter_strategy", default=None)
+    parser.add_argument("--router-group-min-support", dest="router_group_min_support", type=int, default=None)
+    parser.add_argument("--router-group-min-invoked", dest="router_group_min_invoked", type=int, default=None)
+    parser.add_argument("--router-group-threshold-mode", dest="router_group_threshold_mode", default=None)
+    parser.add_argument("--router-group-threshold-min-support", dest="router_group_threshold_min_support", type=int, default=None)
+    parser.add_argument("--router-group-threshold-min-errors", dest="router_group_threshold_min_errors", type=int, default=None)
+    parser.add_argument(
+        "--router-group-threshold-min-predicted-positive",
+        dest="router_group_threshold_min_predicted_positive",
+        type=int,
+        default=None,
+    )
+    parser.add_argument("--router-group-threshold-target-fpr", dest="router_group_threshold_target_fpr", type=float, default=None)
+    parser.add_argument(
+        "--router-group-threshold-max-false-positive",
+        dest="router_group_threshold_max_false_positive",
+        type=int,
+        default=None,
+    )
+    parser.add_argument("--router-group-threshold-boost", dest="router_group_threshold_boost", type=float, default=None)
+    parser.add_argument("--router-group-boost-min-support", dest="router_group_boost_min_support", type=int, default=None)
+    parser.add_argument("--router-group-boost-min-invoked", dest="router_group_boost_min_invoked", type=int, default=None)
+    parser.add_argument("--router-group-boost-max-net-rescue", dest="router_group_boost_max_net_rescue", type=float, default=None)
+    parser.add_argument("--router-group-boost-min-harm", dest="router_group_boost_min_harm", type=int, default=None)
+    parser.add_argument("--allow-router-group-nonpositive-net", dest="router_group_require_positive_net", action="store_false")
+    parser.add_argument("--disable-router-group-fallback", dest="router_group_fallback_to_client", action="store_false")
     parser.add_argument("--retrain-router-from-checkpoint", dest="risk_predictor_retrain_on_load", action="store_true")
     parser.add_argument("--best-checkpoint-path", dest="best_checkpoint_path", default=None)
     parser.add_argument("--load-checkpoint-path", dest="load_checkpoint_path", default=None)
@@ -67,6 +123,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.set_defaults(error_predictor_disable_on_precision_fail=None)
     parser.set_defaults(route_disable_when_no_gain=None)
     parser.set_defaults(route_gain_filter_require_positive_net=None)
+    parser.set_defaults(router_group_require_positive_net=None)
+    parser.set_defaults(router_group_fallback_to_client=None)
+    parser.set_defaults(router_diagnostics_enabled=None)
+    parser.set_defaults(router_diagnostics_include_classes=None)
+    parser.set_defaults(risk_predictor_hard_negative_enabled=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--prox-mu", dest="prox_mu", type=float, default=None)
     return parser
@@ -148,19 +209,45 @@ def _log_effective_config_summary(config: ExperimentConfig) -> None:
         "risk_predictor_hidden_dim": config.federated.risk_predictor_hidden_dim,
         "risk_predictor_dropout": config.federated.risk_predictor_dropout,
         "risk_predictor_retrain_on_load": config.federated.risk_predictor_retrain_on_load,
+        "risk_predictor_hard_negative_enabled": config.federated.risk_predictor_hard_negative_enabled,
+        "risk_predictor_hard_negative_quantile": config.federated.risk_predictor_hard_negative_quantile,
+        "risk_predictor_hard_negative_weight": config.federated.risk_predictor_hard_negative_weight,
+        "risk_predictor_hard_negative_warmup_epochs": config.federated.risk_predictor_hard_negative_warmup_epochs,
         "route_disable_when_no_gain": config.federated.route_disable_when_no_gain,
         "route_min_gain": config.federated.route_min_gain,
         "route_gain_filter_min_invoked": config.federated.route_gain_filter_min_invoked,
         "route_gain_filter_require_positive_net": config.federated.route_gain_filter_require_positive_net,
+        "router_group_mode": config.federated.router_group_mode,
+        "router_group_filter_strategy": config.federated.router_group_filter_strategy,
+        "router_group_min_support": config.federated.router_group_min_support,
+        "router_group_min_invoked": config.federated.router_group_min_invoked,
+        "router_group_require_positive_net": config.federated.router_group_require_positive_net,
+        "router_group_fallback_to_client": config.federated.router_group_fallback_to_client,
+        "router_group_threshold_mode": config.federated.router_group_threshold_mode,
+        "router_group_threshold_min_support": config.federated.router_group_threshold_min_support,
+        "router_group_threshold_min_errors": config.federated.router_group_threshold_min_errors,
+        "router_group_threshold_min_predicted_positive": config.federated.router_group_threshold_min_predicted_positive,
+        "router_group_threshold_target_fpr": config.federated.router_group_threshold_target_fpr,
+        "router_group_threshold_max_false_positive": config.federated.router_group_threshold_max_false_positive,
+        "router_group_threshold_boost": config.federated.router_group_threshold_boost,
+        "router_group_boost_min_support": config.federated.router_group_boost_min_support,
+        "router_group_boost_min_invoked": config.federated.router_group_boost_min_invoked,
+        "router_group_boost_max_net_rescue": config.federated.router_group_boost_max_net_rescue,
+        "router_group_boost_min_harm": config.federated.router_group_boost_min_harm,
         "routing_policy": config.inference.routing_policy,
         "error_predictor_threshold": config.inference.error_predictor_threshold,
         "error_predictor_threshold_mode": config.inference.error_predictor_threshold_mode,
         "error_predictor_target_precision": config.inference.error_predictor_target_precision,
+        "error_predictor_target_fpr": config.inference.error_predictor_target_fpr,
+        "error_predictor_max_false_positive": config.inference.error_predictor_max_false_positive,
         "error_predictor_min_predicted_positive": config.inference.error_predictor_min_predicted_positive,
         "error_predictor_disable_on_precision_fail": config.inference.error_predictor_disable_on_precision_fail,
         "error_predictor_use_wilson_lower_bound": config.inference.error_predictor_use_wilson_lower_bound,
         "error_predictor_wilson_z": config.inference.error_predictor_wilson_z,
         "error_predictor_high_confidence_guard": config.inference.error_predictor_high_confidence_guard,
+        "router_diagnostics_enabled": config.inference.router_diagnostics_enabled,
+        "router_diagnostics_min_samples": config.inference.router_diagnostics_min_samples,
+        "router_diagnostics_include_classes": config.inference.router_diagnostics_include_classes,
     }
     model = {
         "general_architecture": config.model.general_architecture,
@@ -216,6 +303,8 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         "error_predictor_threshold": args.error_predictor_threshold,
         "error_predictor_threshold_mode": args.error_predictor_threshold_mode,
         "error_predictor_target_precision": args.error_predictor_target_precision,
+        "error_predictor_target_fpr": args.error_predictor_target_fpr,
+        "error_predictor_max_false_positive": args.error_predictor_max_false_positive,
         "error_predictor_min_predicted_positive": args.error_predictor_min_predicted_positive,
         "error_predictor_disable_on_precision_fail": args.error_predictor_disable_on_precision_fail,
         "error_predictor_high_confidence_guard": args.error_predictor_high_confidence_guard,
@@ -223,6 +312,9 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
             args.error_predictor_use_wilson_lower_bound if args.error_predictor_use_wilson_lower_bound else None
         ),
         "error_predictor_wilson_z": args.error_predictor_wilson_z,
+        "router_diagnostics_enabled": args.router_diagnostics_enabled,
+        "router_diagnostics_min_samples": args.router_diagnostics_min_samples,
+        "router_diagnostics_include_classes": args.router_diagnostics_include_classes,
         "calibration_ratio": args.calibration_ratio,
         "calibration_max_samples": args.calibration_max_samples,
         "router_validation_ratio": args.router_validation_ratio,
@@ -230,10 +322,31 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         "risk_predictor_lr": args.risk_predictor_lr,
         "risk_predictor_hidden_dim": args.risk_predictor_hidden_dim,
         "risk_predictor_dropout": args.risk_predictor_dropout,
+        "risk_predictor_hard_negative_enabled": args.risk_predictor_hard_negative_enabled,
+        "risk_predictor_hard_negative_quantile": args.risk_predictor_hard_negative_quantile,
+        "risk_predictor_hard_negative_weight": args.risk_predictor_hard_negative_weight,
+        "risk_predictor_hard_negative_warmup_epochs": args.risk_predictor_hard_negative_warmup_epochs,
         "route_min_gain": args.route_min_gain,
         "route_gain_filter_min_invoked": args.route_gain_filter_min_invoked,
         "route_gain_filter_require_positive_net": args.route_gain_filter_require_positive_net,
         "route_disable_when_no_gain": args.route_disable_when_no_gain,
+        "router_group_mode": args.router_group_mode,
+        "router_group_filter_strategy": args.router_group_filter_strategy,
+        "router_group_min_support": args.router_group_min_support,
+        "router_group_min_invoked": args.router_group_min_invoked,
+        "router_group_threshold_mode": args.router_group_threshold_mode,
+        "router_group_threshold_min_support": args.router_group_threshold_min_support,
+        "router_group_threshold_min_errors": args.router_group_threshold_min_errors,
+        "router_group_threshold_min_predicted_positive": args.router_group_threshold_min_predicted_positive,
+        "router_group_threshold_target_fpr": args.router_group_threshold_target_fpr,
+        "router_group_threshold_max_false_positive": args.router_group_threshold_max_false_positive,
+        "router_group_threshold_boost": args.router_group_threshold_boost,
+        "router_group_boost_min_support": args.router_group_boost_min_support,
+        "router_group_boost_min_invoked": args.router_group_boost_min_invoked,
+        "router_group_boost_max_net_rescue": args.router_group_boost_max_net_rescue,
+        "router_group_boost_min_harm": args.router_group_boost_min_harm,
+        "router_group_require_positive_net": args.router_group_require_positive_net,
+        "router_group_fallback_to_client": args.router_group_fallback_to_client,
         "risk_predictor_retrain_on_load": args.risk_predictor_retrain_on_load if args.risk_predictor_retrain_on_load else None,
         "best_checkpoint_path": args.best_checkpoint_path,
         "load_checkpoint_path": args.load_checkpoint_path,

@@ -47,17 +47,38 @@ federated:
   calibration_ratio: 0.20
   calibration_min_samples: 32
   calibration_max_samples: 1024
-  router_validation_ratio: 0.50
+  router_validation_ratio: 0.20
   risk_predictor_epochs: 80
   risk_predictor_lr: 0.001
   risk_predictor_weight_decay: 0.0
-  risk_predictor_hidden_dim: 32
+  risk_predictor_hidden_dim: 64
   risk_predictor_dropout: 0.10
   risk_predictor_retrain_on_load: false
+  risk_predictor_hard_negative_enabled: true
+  risk_predictor_hard_negative_quantile: 0.90
+  risk_predictor_hard_negative_weight: 1.25
+  risk_predictor_hard_negative_warmup_epochs: 40
   route_disable_when_no_gain: true
-  route_min_gain: 0.0
+  route_min_gain: 0.01
   route_gain_filter_min_invoked: 10
   route_gain_filter_require_positive_net: true
+  router_group_mode: predicted_class
+  router_group_filter_strategy: negative_net
+  router_group_min_support: 5
+  router_group_min_invoked: 2
+  router_group_require_positive_net: true
+  router_group_fallback_to_client: true
+  router_group_threshold_mode: boost
+  router_group_threshold_min_support: 20
+  router_group_threshold_min_errors: 3
+  router_group_threshold_min_predicted_positive: 3
+  router_group_threshold_target_fpr: 0.10
+  router_group_threshold_max_false_positive: 2
+  router_group_threshold_boost: 0.05
+  router_group_boost_min_support: 20
+  router_group_boost_min_invoked: 4
+  router_group_boost_max_net_rescue: 2.0
+  router_group_boost_min_harm: 1
 
   dkdr_mu: 0.50
   general_pretrain_imagenet_init: false
@@ -77,7 +98,9 @@ inference:
   routing_policy: error_predictor_general_fallback
   error_predictor_threshold: 0.85
   error_predictor_threshold_mode: precision
-  error_predictor_target_precision: 0.90
+  error_predictor_target_precision: 0.75
+  error_predictor_target_fpr: 0.01
+  error_predictor_max_false_positive: 5
   error_predictor_min_predicted_positive: 3
   error_predictor_disable_on_precision_fail: true
   error_predictor_use_wilson_lower_bound: false

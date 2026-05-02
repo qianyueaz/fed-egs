@@ -180,11 +180,32 @@ class FederatedConfig:
     risk_predictor_hidden_dim: int = 32
     risk_predictor_dropout: float = 0.1
     risk_predictor_retrain_on_load: bool = False
+    risk_predictor_hard_negative_enabled: bool = False
+    risk_predictor_hard_negative_quantile: float = 0.9
+    risk_predictor_hard_negative_weight: float = 1.25
+    risk_predictor_hard_negative_warmup_epochs: int = 40
     route_min_gain: float = 0.0
     route_gain_filter_min_invoked: int = 10
     route_gain_filter_require_positive_net: bool = True
     route_max_invocation_when_general_worse: float = 0.0
     route_disable_when_no_gain: bool = True
+    router_group_mode: str = "none"
+    router_group_filter_strategy: str = "blocklist"
+    router_group_min_support: int = 20
+    router_group_min_invoked: int = 5
+    router_group_require_positive_net: bool = True
+    router_group_fallback_to_client: bool = True
+    router_group_threshold_mode: str = "none"
+    router_group_threshold_min_support: int = 20
+    router_group_threshold_min_errors: int = 3
+    router_group_threshold_min_predicted_positive: int = 3
+    router_group_threshold_target_fpr: float = 0.10
+    router_group_threshold_max_false_positive: int = 2
+    router_group_threshold_boost: float = 0.0
+    router_group_boost_min_support: int = 20
+    router_group_boost_min_invoked: int = 5
+    router_group_boost_max_net_rescue: float = 1.0
+    router_group_boost_min_harm: int = 1
     fedasym_best_metric: str = "auto"
     general_deploy_ema_momentum: float = 0.90
     general_deploy_warmup_rounds: int = 80
@@ -344,11 +365,17 @@ class InferenceConfig:
     error_predictor_threshold: float = 0.5
     error_predictor_threshold_mode: str = "fixed"
     error_predictor_target_precision: float = 0.80
+    error_predictor_target_fpr: float = 0.01
+    error_predictor_max_false_positive: int = 5
     error_predictor_min_predicted_positive: int = 3
     error_predictor_disable_on_precision_fail: bool = True
     error_predictor_high_confidence_guard: float = 1.0
     error_predictor_use_wilson_lower_bound: bool = False
     error_predictor_wilson_z: float = 1.96
+    router_diagnostics_enabled: bool = False
+    router_diagnostics_min_samples: int = 20
+    router_diagnostics_include_classes: bool = True
+    router_diagnostics_confidence_bins: List[float] = field(default_factory=lambda: [0.5, 0.7, 0.85, 0.95])
     routing_error_min_threshold: float = 0.05
     routing_error_max_threshold: float = 0.95
     client_force_general_gap: float = 0.12
@@ -442,11 +469,16 @@ def _resolve_override_target(config: ExperimentConfig, key: str):
         "error_predictor_threshold": (config.inference, "error_predictor_threshold"),
         "error_predictor_threshold_mode": (config.inference, "error_predictor_threshold_mode"),
         "error_predictor_target_precision": (config.inference, "error_predictor_target_precision"),
+        "error_predictor_target_fpr": (config.inference, "error_predictor_target_fpr"),
+        "error_predictor_max_false_positive": (config.inference, "error_predictor_max_false_positive"),
         "error_predictor_min_predicted_positive": (config.inference, "error_predictor_min_predicted_positive"),
         "error_predictor_disable_on_precision_fail": (config.inference, "error_predictor_disable_on_precision_fail"),
         "error_predictor_high_confidence_guard": (config.inference, "error_predictor_high_confidence_guard"),
         "error_predictor_use_wilson_lower_bound": (config.inference, "error_predictor_use_wilson_lower_bound"),
         "error_predictor_wilson_z": (config.inference, "error_predictor_wilson_z"),
+        "router_diagnostics_enabled": (config.inference, "router_diagnostics_enabled"),
+        "router_diagnostics_min_samples": (config.inference, "router_diagnostics_min_samples"),
+        "router_diagnostics_include_classes": (config.inference, "router_diagnostics_include_classes"),
         "calibration_ratio": (config.federated, "calibration_ratio"),
         "calibration_max_samples": (config.federated, "calibration_max_samples"),
         "router_validation_ratio": (config.federated, "router_validation_ratio"),
@@ -455,10 +487,49 @@ def _resolve_override_target(config: ExperimentConfig, key: str):
         "risk_predictor_hidden_dim": (config.federated, "risk_predictor_hidden_dim"),
         "risk_predictor_dropout": (config.federated, "risk_predictor_dropout"),
         "risk_predictor_retrain_on_load": (config.federated, "risk_predictor_retrain_on_load"),
+        "risk_predictor_hard_negative_enabled": (
+            config.federated,
+            "risk_predictor_hard_negative_enabled",
+        ),
+        "risk_predictor_hard_negative_quantile": (
+            config.federated,
+            "risk_predictor_hard_negative_quantile",
+        ),
+        "risk_predictor_hard_negative_weight": (
+            config.federated,
+            "risk_predictor_hard_negative_weight",
+        ),
+        "risk_predictor_hard_negative_warmup_epochs": (
+            config.federated,
+            "risk_predictor_hard_negative_warmup_epochs",
+        ),
         "route_min_gain": (config.federated, "route_min_gain"),
         "route_gain_filter_min_invoked": (config.federated, "route_gain_filter_min_invoked"),
         "route_gain_filter_require_positive_net": (config.federated, "route_gain_filter_require_positive_net"),
         "route_disable_when_no_gain": (config.federated, "route_disable_when_no_gain"),
+        "router_group_mode": (config.federated, "router_group_mode"),
+        "router_group_filter_strategy": (config.federated, "router_group_filter_strategy"),
+        "router_group_min_support": (config.federated, "router_group_min_support"),
+        "router_group_min_invoked": (config.federated, "router_group_min_invoked"),
+        "router_group_require_positive_net": (config.federated, "router_group_require_positive_net"),
+        "router_group_fallback_to_client": (config.federated, "router_group_fallback_to_client"),
+        "router_group_threshold_mode": (config.federated, "router_group_threshold_mode"),
+        "router_group_threshold_min_support": (config.federated, "router_group_threshold_min_support"),
+        "router_group_threshold_min_errors": (config.federated, "router_group_threshold_min_errors"),
+        "router_group_threshold_min_predicted_positive": (
+            config.federated,
+            "router_group_threshold_min_predicted_positive",
+        ),
+        "router_group_threshold_target_fpr": (config.federated, "router_group_threshold_target_fpr"),
+        "router_group_threshold_max_false_positive": (
+            config.federated,
+            "router_group_threshold_max_false_positive",
+        ),
+        "router_group_threshold_boost": (config.federated, "router_group_threshold_boost"),
+        "router_group_boost_min_support": (config.federated, "router_group_boost_min_support"),
+        "router_group_boost_min_invoked": (config.federated, "router_group_boost_min_invoked"),
+        "router_group_boost_max_net_rescue": (config.federated, "router_group_boost_max_net_rescue"),
+        "router_group_boost_min_harm": (config.federated, "router_group_boost_min_harm"),
         "best_checkpoint_path": (config.federated, "best_checkpoint_path"),
         "load_checkpoint_path": (config.federated, "load_checkpoint_path"),
         "eval_only_from_checkpoint": (config.federated, "eval_only_from_checkpoint"),
