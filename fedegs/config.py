@@ -184,6 +184,7 @@ class FederatedConfig:
     risk_predictor_hard_negative_quantile: float = 0.9
     risk_predictor_hard_negative_weight: float = 1.25
     risk_predictor_hard_negative_warmup_epochs: int = 40
+    risk_predictor_tta_enabled: bool = False
     route_min_gain: float = 0.0
     route_gain_filter_min_invoked: int = 10
     route_gain_filter_require_positive_net: bool = True
@@ -376,6 +377,45 @@ class InferenceConfig:
     router_diagnostics_min_samples: int = 20
     router_diagnostics_include_classes: bool = True
     router_diagnostics_confidence_bins: List[float] = field(default_factory=lambda: [0.5, 0.7, 0.85, 0.95])
+    router_regret_diagnostics_enabled: bool = False
+    router_candidate_diagnostics_enabled: bool = False
+    router_candidate_rates: List[float] = field(default_factory=lambda: [0.01, 0.02, 0.05, 0.10, 0.15, 0.20])
+    router_candidate_rate: float = 0.10
+    router_candidate_tta_weight: float = 0.10
+    router_candidate_min_score: float = 0.0
+    router_candidate_disable_high_confidence_guard: bool = True
+    router_candidate_confidence_bins_enabled: bool = False
+    router_candidate_confidence_bin_rates: List[float] = field(default_factory=list)
+    route_verifier_hidden_dim: int = 32
+    route_verifier_dropout: float = 0.10
+    route_verifier_epochs: int = 60
+    route_verifier_lr: float = 0.001
+    route_verifier_weight_decay: float = 0.0
+    route_verifier_negative_weight: float = 2.0
+    route_verifier_neutral_weight: float = 0.0
+    route_verifier_threshold_mode: str = "harm_constrained"
+    route_verifier_threshold: float = 0.5
+    route_verifier_min_adopt_threshold: float = 0.0
+    route_verifier_low_threshold_train_harm_ratio: float = 0.0
+    route_verifier_low_threshold_train_harm_min_candidates: int = 10
+    route_verifier_harm_lambda: float = 1.0
+    route_verifier_adoption_mode: str = "fusion"
+    route_verifier_confidence_bin_thresholds_enabled: bool = False
+    route_verifier_bin_min_validation_adopted: int = 2
+    route_fusion_alpha_source: str = "verifier"
+    route_fusion_alpha_min: float = 0.35
+    route_fusion_alpha_max: float = 0.85
+    route_fusion_alpha_fixed: float = 0.50
+    route_fusion_confidence_alpha_enabled: bool = False
+    route_fusion_confidence_alpha_max_values: List[float] = field(default_factory=list)
+    router_max_harm_rate: float = 0.01
+    router_min_rescue_harm_ratio: float = 1.0
+    router_min_adopted: int = 3
+    router_min_rescue: int = 1
+    route_verifier_min_validation_adopted: int = 0
+    route_verifier_min_validation_net: float = 0.0
+    route_verifier_min_validation_rescue_harm_ratio: float = 1.0
+    route_verifier_disable_on_validation_fail: bool = True
     routing_error_min_threshold: float = 0.05
     routing_error_max_threshold: float = 0.95
     client_force_general_gap: float = 0.12
@@ -463,6 +503,7 @@ def _resolve_override_target(config: ExperimentConfig, key: str):
         "device": (config.federated, "device"),
         "difficulty_checkpoint": (config.dataset, "difficulty_checkpoint"),
         "routing_threshold": (config.inference, "confidence_threshold"),
+        "routing_policy": (config.inference, "routing_policy"),
         "high_threshold": (config.inference, "high_threshold"),
         "low_threshold": (config.inference, "low_threshold"),
         "route_distance_threshold": (config.inference, "route_distance_threshold"),
@@ -479,6 +520,81 @@ def _resolve_override_target(config: ExperimentConfig, key: str):
         "router_diagnostics_enabled": (config.inference, "router_diagnostics_enabled"),
         "router_diagnostics_min_samples": (config.inference, "router_diagnostics_min_samples"),
         "router_diagnostics_include_classes": (config.inference, "router_diagnostics_include_classes"),
+        "router_regret_diagnostics_enabled": (config.inference, "router_regret_diagnostics_enabled"),
+        "router_candidate_diagnostics_enabled": (config.inference, "router_candidate_diagnostics_enabled"),
+        "router_candidate_rates": (config.inference, "router_candidate_rates"),
+        "router_candidate_rate": (config.inference, "router_candidate_rate"),
+        "router_candidate_tta_weight": (config.inference, "router_candidate_tta_weight"),
+        "router_candidate_min_score": (config.inference, "router_candidate_min_score"),
+        "router_candidate_disable_high_confidence_guard": (
+            config.inference,
+            "router_candidate_disable_high_confidence_guard",
+        ),
+        "router_candidate_confidence_bins_enabled": (
+            config.inference,
+            "router_candidate_confidence_bins_enabled",
+        ),
+        "router_candidate_confidence_bin_rates": (
+            config.inference,
+            "router_candidate_confidence_bin_rates",
+        ),
+        "route_verifier_hidden_dim": (config.inference, "route_verifier_hidden_dim"),
+        "route_verifier_dropout": (config.inference, "route_verifier_dropout"),
+        "route_verifier_epochs": (config.inference, "route_verifier_epochs"),
+        "route_verifier_lr": (config.inference, "route_verifier_lr"),
+        "route_verifier_weight_decay": (config.inference, "route_verifier_weight_decay"),
+        "route_verifier_negative_weight": (config.inference, "route_verifier_negative_weight"),
+        "route_verifier_neutral_weight": (config.inference, "route_verifier_neutral_weight"),
+        "route_verifier_threshold_mode": (config.inference, "route_verifier_threshold_mode"),
+        "route_verifier_threshold": (config.inference, "route_verifier_threshold"),
+        "route_verifier_min_adopt_threshold": (config.inference, "route_verifier_min_adopt_threshold"),
+        "route_verifier_low_threshold_train_harm_ratio": (
+            config.inference,
+            "route_verifier_low_threshold_train_harm_ratio",
+        ),
+        "route_verifier_low_threshold_train_harm_min_candidates": (
+            config.inference,
+            "route_verifier_low_threshold_train_harm_min_candidates",
+        ),
+        "route_verifier_harm_lambda": (config.inference, "route_verifier_harm_lambda"),
+        "route_verifier_adoption_mode": (config.inference, "route_verifier_adoption_mode"),
+        "route_verifier_confidence_bin_thresholds_enabled": (
+            config.inference,
+            "route_verifier_confidence_bin_thresholds_enabled",
+        ),
+        "route_verifier_bin_min_validation_adopted": (
+            config.inference,
+            "route_verifier_bin_min_validation_adopted",
+        ),
+        "route_fusion_alpha_source": (config.inference, "route_fusion_alpha_source"),
+        "route_fusion_alpha_min": (config.inference, "route_fusion_alpha_min"),
+        "route_fusion_alpha_max": (config.inference, "route_fusion_alpha_max"),
+        "route_fusion_alpha_fixed": (config.inference, "route_fusion_alpha_fixed"),
+        "route_fusion_confidence_alpha_enabled": (
+            config.inference,
+            "route_fusion_confidence_alpha_enabled",
+        ),
+        "route_fusion_confidence_alpha_max_values": (
+            config.inference,
+            "route_fusion_confidence_alpha_max_values",
+        ),
+        "router_max_harm_rate": (config.inference, "router_max_harm_rate"),
+        "router_min_rescue_harm_ratio": (config.inference, "router_min_rescue_harm_ratio"),
+        "router_min_adopted": (config.inference, "router_min_adopted"),
+        "router_min_rescue": (config.inference, "router_min_rescue"),
+        "route_verifier_min_validation_adopted": (
+            config.inference,
+            "route_verifier_min_validation_adopted",
+        ),
+        "route_verifier_min_validation_net": (config.inference, "route_verifier_min_validation_net"),
+        "route_verifier_min_validation_rescue_harm_ratio": (
+            config.inference,
+            "route_verifier_min_validation_rescue_harm_ratio",
+        ),
+        "route_verifier_disable_on_validation_fail": (
+            config.inference,
+            "route_verifier_disable_on_validation_fail",
+        ),
         "calibration_ratio": (config.federated, "calibration_ratio"),
         "calibration_max_samples": (config.federated, "calibration_max_samples"),
         "router_validation_ratio": (config.federated, "router_validation_ratio"),
@@ -503,6 +619,7 @@ def _resolve_override_target(config: ExperimentConfig, key: str):
             config.federated,
             "risk_predictor_hard_negative_warmup_epochs",
         ),
+        "risk_predictor_tta_enabled": (config.federated, "risk_predictor_tta_enabled"),
         "route_min_gain": (config.federated, "route_min_gain"),
         "route_gain_filter_min_invoked": (config.federated, "route_gain_filter_min_invoked"),
         "route_gain_filter_require_positive_net": (config.federated, "route_gain_filter_require_positive_net"),

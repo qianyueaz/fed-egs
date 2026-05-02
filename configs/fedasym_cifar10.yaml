@@ -58,6 +58,7 @@ federated:
   risk_predictor_hard_negative_quantile: 0.90
   risk_predictor_hard_negative_weight: 1.25
   risk_predictor_hard_negative_warmup_epochs: 40
+  risk_predictor_tta_enabled: true
   route_disable_when_no_gain: true
   route_min_gain: 0.01
   route_gain_filter_min_invoked: 10
@@ -95,7 +96,7 @@ model:
   expert_base_channels: 32
 
 inference:
-  routing_policy: error_predictor_general_fallback
+  routing_policy: two_stage_error_verifier
   error_predictor_threshold: 0.85
   error_predictor_threshold_mode: precision
   error_predictor_target_precision: 0.75
@@ -106,3 +107,41 @@ inference:
   error_predictor_use_wilson_lower_bound: false
   error_predictor_wilson_z: 1.96
   error_predictor_high_confidence_guard: 0.95
+  router_regret_diagnostics_enabled: true
+  router_candidate_diagnostics_enabled: true
+  router_candidate_rates: [0.01, 0.02, 0.05, 0.10, 0.15, 0.20]
+  router_candidate_rate: 0.10
+  router_candidate_tta_weight: 0.10
+  router_candidate_min_score: 0.0
+  router_candidate_disable_high_confidence_guard: true
+  router_candidate_confidence_bins_enabled: false
+  router_candidate_confidence_bin_rates: [0.10, 0.10, 0.08, 0.04, 0.02]
+  route_verifier_hidden_dim: 32
+  route_verifier_dropout: 0.10
+  route_verifier_epochs: 60
+  route_verifier_lr: 0.001
+  route_verifier_weight_decay: 0.0
+  route_verifier_negative_weight: 1.5
+  route_verifier_neutral_weight: 0.1
+  route_verifier_threshold_mode: harm_constrained
+  route_verifier_min_adopt_threshold: 0.20
+  route_verifier_low_threshold_train_harm_ratio: 2.0
+  route_verifier_low_threshold_train_harm_min_candidates: 10
+  route_verifier_harm_lambda: 1.0
+  route_verifier_adoption_mode: fusion
+  route_verifier_confidence_bin_thresholds_enabled: false
+  route_verifier_bin_min_validation_adopted: 2
+  route_fusion_alpha_source: verifier
+  route_fusion_alpha_min: 0.35
+  route_fusion_alpha_max: 0.85
+  route_fusion_alpha_fixed: 0.50
+  route_fusion_confidence_alpha_enabled: true
+  route_fusion_confidence_alpha_max_values: [0.85, 0.80, 0.70, 0.55, 0.45]
+  router_max_harm_rate: 0.008
+  router_min_rescue_harm_ratio: 1.0
+  router_min_adopted: 2
+  router_min_rescue: 1
+  route_verifier_min_validation_adopted: 4
+  route_verifier_min_validation_net: 0.0
+  route_verifier_min_validation_rescue_harm_ratio: 1.0
+  route_verifier_disable_on_validation_fail: true

@@ -36,6 +36,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default=None)
     parser.add_argument("--difficulty-checkpoint", default=None)
     parser.add_argument("--routing-threshold", dest="routing_threshold", type=float, default=None)
+    parser.add_argument("--routing-policy", dest="routing_policy", default=None)
     parser.add_argument("--high-threshold", type=float, default=None)
     parser.add_argument("--low-threshold", type=float, default=None)
     parser.add_argument("--route-distance-threshold", dest="route_distance_threshold", type=float, default=None)
@@ -52,6 +53,93 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--router-diagnostics", dest="router_diagnostics_enabled", action="store_true")
     parser.add_argument("--router-diagnostics-min-samples", dest="router_diagnostics_min_samples", type=int, default=None)
     parser.add_argument("--disable-router-diagnostics-classes", dest="router_diagnostics_include_classes", action="store_false")
+    parser.add_argument("--router-regret-diagnostics", dest="router_regret_diagnostics_enabled", action="store_true")
+    parser.add_argument("--router-candidate-diagnostics", dest="router_candidate_diagnostics_enabled", action="store_true")
+    parser.add_argument("--router-candidate-rates", dest="router_candidate_rates", default=None)
+    parser.add_argument("--router-candidate-rate", dest="router_candidate_rate", type=float, default=None)
+    parser.add_argument("--router-candidate-tta-weight", dest="router_candidate_tta_weight", type=float, default=None)
+    parser.add_argument("--router-candidate-min-score", dest="router_candidate_min_score", type=float, default=None)
+    parser.add_argument(
+        "--router-candidate-confidence-bins",
+        dest="router_candidate_confidence_bins_enabled",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--router-candidate-confidence-bin-rates",
+        dest="router_candidate_confidence_bin_rates",
+        default=None,
+    )
+    parser.add_argument(
+        "--use-candidate-high-confidence-guard",
+        dest="router_candidate_disable_high_confidence_guard",
+        action="store_false",
+    )
+    parser.add_argument("--route-verifier-hidden-dim", dest="route_verifier_hidden_dim", type=int, default=None)
+    parser.add_argument("--route-verifier-dropout", dest="route_verifier_dropout", type=float, default=None)
+    parser.add_argument("--route-verifier-epochs", dest="route_verifier_epochs", type=int, default=None)
+    parser.add_argument("--route-verifier-lr", dest="route_verifier_lr", type=float, default=None)
+    parser.add_argument("--route-verifier-weight-decay", dest="route_verifier_weight_decay", type=float, default=None)
+    parser.add_argument("--route-verifier-negative-weight", dest="route_verifier_negative_weight", type=float, default=None)
+    parser.add_argument("--route-verifier-neutral-weight", dest="route_verifier_neutral_weight", type=float, default=None)
+    parser.add_argument("--route-verifier-threshold-mode", dest="route_verifier_threshold_mode", default=None)
+    parser.add_argument("--route-verifier-threshold", dest="route_verifier_threshold", type=float, default=None)
+    parser.add_argument("--route-verifier-min-adopt-threshold", dest="route_verifier_min_adopt_threshold", type=float, default=None)
+    parser.add_argument(
+        "--route-verifier-low-threshold-train-harm-ratio",
+        dest="route_verifier_low_threshold_train_harm_ratio",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--route-verifier-low-threshold-train-harm-min-candidates",
+        dest="route_verifier_low_threshold_train_harm_min_candidates",
+        type=int,
+        default=None,
+    )
+    parser.add_argument("--route-verifier-harm-lambda", dest="route_verifier_harm_lambda", type=float, default=None)
+    parser.add_argument("--route-verifier-adoption-mode", dest="route_verifier_adoption_mode", default=None)
+    parser.add_argument(
+        "--route-verifier-confidence-bin-thresholds",
+        dest="route_verifier_confidence_bin_thresholds_enabled",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--route-verifier-bin-min-validation-adopted",
+        dest="route_verifier_bin_min_validation_adopted",
+        type=int,
+        default=None,
+    )
+    parser.add_argument("--route-fusion-alpha-source", dest="route_fusion_alpha_source", default=None)
+    parser.add_argument("--route-fusion-alpha-min", dest="route_fusion_alpha_min", type=float, default=None)
+    parser.add_argument("--route-fusion-alpha-max", dest="route_fusion_alpha_max", type=float, default=None)
+    parser.add_argument("--route-fusion-alpha-fixed", dest="route_fusion_alpha_fixed", type=float, default=None)
+    parser.add_argument(
+        "--route-fusion-confidence-alpha",
+        dest="route_fusion_confidence_alpha_enabled",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--route-fusion-confidence-alpha-max-values",
+        dest="route_fusion_confidence_alpha_max_values",
+        default=None,
+    )
+    parser.add_argument("--router-max-harm-rate", dest="router_max_harm_rate", type=float, default=None)
+    parser.add_argument("--router-min-rescue-harm-ratio", dest="router_min_rescue_harm_ratio", type=float, default=None)
+    parser.add_argument("--router-min-adopted", dest="router_min_adopted", type=int, default=None)
+    parser.add_argument("--router-min-rescue", dest="router_min_rescue", type=int, default=None)
+    parser.add_argument("--route-verifier-min-validation-adopted", dest="route_verifier_min_validation_adopted", type=int, default=None)
+    parser.add_argument("--route-verifier-min-validation-net", dest="route_verifier_min_validation_net", type=float, default=None)
+    parser.add_argument(
+        "--route-verifier-min-validation-rescue-harm-ratio",
+        dest="route_verifier_min_validation_rescue_harm_ratio",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--allow-route-verifier-validation-fail",
+        dest="route_verifier_disable_on_validation_fail",
+        action="store_false",
+    )
     parser.add_argument("--calibration-ratio", dest="calibration_ratio", type=float, default=None)
     parser.add_argument("--calibration-max-samples", dest="calibration_max_samples", type=int, default=None)
     parser.add_argument("--router-validation-ratio", dest="router_validation_ratio", type=float, default=None)
@@ -83,6 +171,8 @@ def build_argparser() -> argparse.ArgumentParser:
         type=int,
         default=None,
     )
+    parser.add_argument("--risk-predictor-tta", dest="risk_predictor_tta_enabled", action="store_true")
+    parser.add_argument("--disable-risk-predictor-tta", dest="risk_predictor_tta_enabled", action="store_false")
     parser.add_argument("--route-min-gain", dest="route_min_gain", type=float, default=None)
     parser.add_argument("--route-gain-filter-min-invoked", dest="route_gain_filter_min_invoked", type=int, default=None)
     parser.add_argument("--allow-route-gain-filter-nonpositive-net", dest="route_gain_filter_require_positive_net", action="store_false")
@@ -127,7 +217,15 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.set_defaults(router_group_fallback_to_client=None)
     parser.set_defaults(router_diagnostics_enabled=None)
     parser.set_defaults(router_diagnostics_include_classes=None)
+    parser.set_defaults(router_regret_diagnostics_enabled=None)
+    parser.set_defaults(router_candidate_diagnostics_enabled=None)
+    parser.set_defaults(router_candidate_confidence_bins_enabled=None)
+    parser.set_defaults(router_candidate_disable_high_confidence_guard=None)
+    parser.set_defaults(route_verifier_confidence_bin_thresholds_enabled=None)
+    parser.set_defaults(route_verifier_disable_on_validation_fail=None)
+    parser.set_defaults(route_fusion_confidence_alpha_enabled=None)
     parser.set_defaults(risk_predictor_hard_negative_enabled=None)
+    parser.set_defaults(risk_predictor_tta_enabled=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--prox-mu", dest="prox_mu", type=float, default=None)
     return parser
@@ -213,6 +311,7 @@ def _log_effective_config_summary(config: ExperimentConfig) -> None:
         "risk_predictor_hard_negative_quantile": config.federated.risk_predictor_hard_negative_quantile,
         "risk_predictor_hard_negative_weight": config.federated.risk_predictor_hard_negative_weight,
         "risk_predictor_hard_negative_warmup_epochs": config.federated.risk_predictor_hard_negative_warmup_epochs,
+        "risk_predictor_tta_enabled": config.federated.risk_predictor_tta_enabled,
         "route_disable_when_no_gain": config.federated.route_disable_when_no_gain,
         "route_min_gain": config.federated.route_min_gain,
         "route_gain_filter_min_invoked": config.federated.route_gain_filter_min_invoked,
@@ -248,6 +347,53 @@ def _log_effective_config_summary(config: ExperimentConfig) -> None:
         "router_diagnostics_enabled": config.inference.router_diagnostics_enabled,
         "router_diagnostics_min_samples": config.inference.router_diagnostics_min_samples,
         "router_diagnostics_include_classes": config.inference.router_diagnostics_include_classes,
+        "router_regret_diagnostics_enabled": config.inference.router_regret_diagnostics_enabled,
+        "router_candidate_diagnostics_enabled": config.inference.router_candidate_diagnostics_enabled,
+        "router_candidate_rates": config.inference.router_candidate_rates,
+        "router_candidate_rate": config.inference.router_candidate_rate,
+        "router_candidate_tta_weight": config.inference.router_candidate_tta_weight,
+        "router_candidate_min_score": config.inference.router_candidate_min_score,
+        "router_candidate_disable_high_confidence_guard": config.inference.router_candidate_disable_high_confidence_guard,
+        "router_candidate_confidence_bins_enabled": config.inference.router_candidate_confidence_bins_enabled,
+        "router_candidate_confidence_bin_rates": config.inference.router_candidate_confidence_bin_rates,
+        "route_verifier_hidden_dim": config.inference.route_verifier_hidden_dim,
+        "route_verifier_dropout": config.inference.route_verifier_dropout,
+        "route_verifier_epochs": config.inference.route_verifier_epochs,
+        "route_verifier_lr": config.inference.route_verifier_lr,
+        "route_verifier_weight_decay": config.inference.route_verifier_weight_decay,
+        "route_verifier_negative_weight": config.inference.route_verifier_negative_weight,
+        "route_verifier_neutral_weight": config.inference.route_verifier_neutral_weight,
+        "route_verifier_threshold_mode": config.inference.route_verifier_threshold_mode,
+        "route_verifier_threshold": config.inference.route_verifier_threshold,
+        "route_verifier_min_adopt_threshold": config.inference.route_verifier_min_adopt_threshold,
+        "route_verifier_low_threshold_train_harm_ratio": (
+            config.inference.route_verifier_low_threshold_train_harm_ratio
+        ),
+        "route_verifier_low_threshold_train_harm_min_candidates": (
+            config.inference.route_verifier_low_threshold_train_harm_min_candidates
+        ),
+        "route_verifier_harm_lambda": config.inference.route_verifier_harm_lambda,
+        "route_verifier_adoption_mode": config.inference.route_verifier_adoption_mode,
+        "route_verifier_confidence_bin_thresholds_enabled": (
+            config.inference.route_verifier_confidence_bin_thresholds_enabled
+        ),
+        "route_verifier_bin_min_validation_adopted": config.inference.route_verifier_bin_min_validation_adopted,
+        "route_fusion_alpha_source": config.inference.route_fusion_alpha_source,
+        "route_fusion_alpha_min": config.inference.route_fusion_alpha_min,
+        "route_fusion_alpha_max": config.inference.route_fusion_alpha_max,
+        "route_fusion_alpha_fixed": config.inference.route_fusion_alpha_fixed,
+        "route_fusion_confidence_alpha_enabled": config.inference.route_fusion_confidence_alpha_enabled,
+        "route_fusion_confidence_alpha_max_values": config.inference.route_fusion_confidence_alpha_max_values,
+        "router_max_harm_rate": config.inference.router_max_harm_rate,
+        "router_min_rescue_harm_ratio": config.inference.router_min_rescue_harm_ratio,
+        "router_min_adopted": config.inference.router_min_adopted,
+        "router_min_rescue": config.inference.router_min_rescue,
+        "route_verifier_min_validation_adopted": config.inference.route_verifier_min_validation_adopted,
+        "route_verifier_min_validation_net": config.inference.route_verifier_min_validation_net,
+        "route_verifier_min_validation_rescue_harm_ratio": (
+            config.inference.route_verifier_min_validation_rescue_harm_ratio
+        ),
+        "route_verifier_disable_on_validation_fail": config.inference.route_verifier_disable_on_validation_fail,
     }
     model = {
         "general_architecture": config.model.general_architecture,
@@ -297,6 +443,7 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         "device": args.device,
         "difficulty_checkpoint": args.difficulty_checkpoint,
         "routing_threshold": args.routing_threshold,
+        "routing_policy": args.routing_policy,
         "high_threshold": args.high_threshold,
         "low_threshold": args.low_threshold,
         "route_distance_threshold": args.route_distance_threshold,
@@ -315,6 +462,47 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         "router_diagnostics_enabled": args.router_diagnostics_enabled,
         "router_diagnostics_min_samples": args.router_diagnostics_min_samples,
         "router_diagnostics_include_classes": args.router_diagnostics_include_classes,
+        "router_regret_diagnostics_enabled": args.router_regret_diagnostics_enabled,
+        "router_candidate_diagnostics_enabled": args.router_candidate_diagnostics_enabled,
+        "router_candidate_rates": args.router_candidate_rates,
+        "router_candidate_rate": args.router_candidate_rate,
+        "router_candidate_tta_weight": args.router_candidate_tta_weight,
+        "router_candidate_min_score": args.router_candidate_min_score,
+        "router_candidate_disable_high_confidence_guard": args.router_candidate_disable_high_confidence_guard,
+        "router_candidate_confidence_bins_enabled": args.router_candidate_confidence_bins_enabled,
+        "router_candidate_confidence_bin_rates": args.router_candidate_confidence_bin_rates,
+        "route_verifier_hidden_dim": args.route_verifier_hidden_dim,
+        "route_verifier_dropout": args.route_verifier_dropout,
+        "route_verifier_epochs": args.route_verifier_epochs,
+        "route_verifier_lr": args.route_verifier_lr,
+        "route_verifier_weight_decay": args.route_verifier_weight_decay,
+        "route_verifier_negative_weight": args.route_verifier_negative_weight,
+        "route_verifier_neutral_weight": args.route_verifier_neutral_weight,
+        "route_verifier_threshold_mode": args.route_verifier_threshold_mode,
+        "route_verifier_threshold": args.route_verifier_threshold,
+        "route_verifier_min_adopt_threshold": args.route_verifier_min_adopt_threshold,
+        "route_verifier_low_threshold_train_harm_ratio": args.route_verifier_low_threshold_train_harm_ratio,
+        "route_verifier_low_threshold_train_harm_min_candidates": (
+            args.route_verifier_low_threshold_train_harm_min_candidates
+        ),
+        "route_verifier_harm_lambda": args.route_verifier_harm_lambda,
+        "route_verifier_adoption_mode": args.route_verifier_adoption_mode,
+        "route_verifier_confidence_bin_thresholds_enabled": args.route_verifier_confidence_bin_thresholds_enabled,
+        "route_verifier_bin_min_validation_adopted": args.route_verifier_bin_min_validation_adopted,
+        "route_fusion_alpha_source": args.route_fusion_alpha_source,
+        "route_fusion_alpha_min": args.route_fusion_alpha_min,
+        "route_fusion_alpha_max": args.route_fusion_alpha_max,
+        "route_fusion_alpha_fixed": args.route_fusion_alpha_fixed,
+        "route_fusion_confidence_alpha_enabled": args.route_fusion_confidence_alpha_enabled,
+        "route_fusion_confidence_alpha_max_values": args.route_fusion_confidence_alpha_max_values,
+        "router_max_harm_rate": args.router_max_harm_rate,
+        "router_min_rescue_harm_ratio": args.router_min_rescue_harm_ratio,
+        "router_min_adopted": args.router_min_adopted,
+        "router_min_rescue": args.router_min_rescue,
+        "route_verifier_min_validation_adopted": args.route_verifier_min_validation_adopted,
+        "route_verifier_min_validation_net": args.route_verifier_min_validation_net,
+        "route_verifier_min_validation_rescue_harm_ratio": args.route_verifier_min_validation_rescue_harm_ratio,
+        "route_verifier_disable_on_validation_fail": args.route_verifier_disable_on_validation_fail,
         "calibration_ratio": args.calibration_ratio,
         "calibration_max_samples": args.calibration_max_samples,
         "router_validation_ratio": args.router_validation_ratio,
@@ -326,6 +514,7 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         "risk_predictor_hard_negative_quantile": args.risk_predictor_hard_negative_quantile,
         "risk_predictor_hard_negative_weight": args.risk_predictor_hard_negative_weight,
         "risk_predictor_hard_negative_warmup_epochs": args.risk_predictor_hard_negative_warmup_epochs,
+        "risk_predictor_tta_enabled": args.risk_predictor_tta_enabled,
         "route_min_gain": args.route_min_gain,
         "route_gain_filter_min_invoked": args.route_gain_filter_min_invoked,
         "route_gain_filter_require_positive_net": args.route_gain_filter_require_positive_net,

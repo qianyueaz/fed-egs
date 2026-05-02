@@ -7,7 +7,9 @@ Design constraints:
     described in the Gemini dialogue,
   - server-side public distillation follows the DKDR bidirectional KL idea,
   - reliability comes only from an explicit client-side error predictor R_k,
-  - routing uses only the predicted expert error probability.
+  - default routing uses only the predicted expert error probability;
+    optional two-stage routing uses that probability as a candidate generator
+    and a calibrated expert/general verifier for final adoption.
 """
 
 from __future__ import annotations
@@ -41,6 +43,8 @@ class FedAsymClientUpdate:
     public_logits: torch.Tensor
     predictor_state: Dict[str, torch.Tensor]
     error_threshold: float
+    public_tta_logits: Optional[torch.Tensor] = None
+    candidate_predictor_state: Optional[Dict[str, torch.Tensor]] = None
 
 
 class GeneralModel(nn.Module):
@@ -132,8 +136,34 @@ def _clone_tensor_dict(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor
     return {key: value.detach().cpu().clone() for key, value in state.items()}
 
 
-def _predictor_feature_dim(num_classes: int) -> int:
-    return 8 + int(num_classes)
+def _parse_float_list(raw_values: object) -> List[float]:
+    if raw_values is None:
+        return []
+    if isinstance(raw_values, str):
+        values = [item.strip() for item in raw_values.split(",")]
+        return [float(item) for item in values if item]
+    if isinstance(raw_values, Sequence):
+        return [float(item) for item in raw_values]
+    return []
+
+
+_PREDICTOR_TTA_FEATURE_DIM = 7
+
+
+def _risk_predictor_tta_enabled(config) -> bool:
+    return bool(getattr(config.federated, "risk_predictor_tta_enabled", False))
+
+
+def _predictor_feature_dim(num_classes: int, tta_enabled: bool = False) -> int:
+    return 8 + int(num_classes) + (_PREDICTOR_TTA_FEATURE_DIM if tta_enabled else 0)
+
+
+def _configured_predictor_feature_dim(config, num_classes: int) -> int:
+    return _predictor_feature_dim(num_classes, tta_enabled=_risk_predictor_tta_enabled(config))
+
+
+def _route_verifier_feature_dim(num_classes: int) -> int:
+    return 28 + (2 * int(num_classes))
 
 
 def _predictor_features_from_logits(logits: torch.Tensor) -> torch.Tensor:
@@ -171,6 +201,97 @@ def _predictor_features_from_logits(logits: torch.Tensor) -> torch.Tensor:
         dim=1,
     )
     return torch.cat([dense_features, predicted_class_onehot], dim=1)
+
+
+def _probability_summary(probs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    topk = torch.topk(probs, k=min(2, probs.size(1)), dim=1)
+    confidence = topk.values[:, 0]
+    if topk.values.size(1) > 1:
+        margin = topk.values[:, 0] - topk.values[:, 1]
+    else:
+        margin = torch.ones_like(confidence)
+    entropy = -(probs * probs.clamp_min(1e-8).log()).sum(dim=1)
+    entropy = entropy / max(math.log(float(probs.size(1))), 1e-8)
+    return confidence, margin, entropy
+
+
+def _predictor_tta_features_from_logits(logits: torch.Tensor, tta_logits: torch.Tensor) -> torch.Tensor:
+    probs = torch.softmax(logits, dim=1)
+    tta_probs = torch.softmax(tta_logits, dim=1)
+    confidence, margin, entropy = _probability_summary(probs)
+    tta_confidence, tta_margin, tta_entropy = _probability_summary(tta_probs)
+    log_probs = probs.clamp_min(1e-8).log()
+    tta_log_probs = tta_probs.clamp_min(1e-8).log()
+    forward_kl = (probs * (log_probs - tta_log_probs)).sum(dim=1)
+    reverse_kl = (tta_probs * (tta_log_probs - log_probs)).sum(dim=1)
+    mean_probs = 0.5 * (probs + tta_probs)
+    mean_entropy = -(mean_probs * mean_probs.clamp_min(1e-8).log()).sum(dim=1)
+    mean_entropy = mean_entropy / max(math.log(float(probs.size(1))), 1e-8)
+    pred_agree = logits.argmax(dim=1).eq(tta_logits.argmax(dim=1)).to(dtype=logits.dtype)
+    return torch.stack(
+        [
+            pred_agree,
+            (confidence - tta_confidence).abs(),
+            (margin - tta_margin).abs(),
+            (entropy - tta_entropy).abs(),
+            forward_kl,
+            reverse_kl,
+            mean_entropy,
+        ],
+        dim=1,
+    )
+
+
+def _predictor_features_from_logits_with_tta(
+    logits: torch.Tensor,
+    tta_logits: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    features = _predictor_features_from_logits(logits)
+    if tta_logits is None:
+        return features
+    return torch.cat([features, _predictor_tta_features_from_logits(logits, tta_logits)], dim=1)
+
+
+def _predictor_features_from_model(
+    config,
+    model: nn.Module,
+    images: torch.Tensor,
+    logits: torch.Tensor,
+) -> torch.Tensor:
+    if not _risk_predictor_tta_enabled(config):
+        return _predictor_features_from_logits(logits)
+    tta_images = torch.flip(images, dims=[-1])
+    tta_logits = model(tta_images)
+    return _predictor_features_from_logits_with_tta(logits, tta_logits)
+
+
+def _route_verifier_features_from_logits(
+    expert_logits: torch.Tensor,
+    general_logits: torch.Tensor,
+    error_probs: torch.Tensor,
+) -> torch.Tensor:
+    expert_features = _predictor_features_from_logits(expert_logits)
+    general_features = _predictor_features_from_logits(general_logits)
+    expert_probs = torch.softmax(expert_logits, dim=1)
+    general_probs = torch.softmax(general_logits, dim=1)
+    expert_log_probs = expert_probs.clamp_min(1e-8).log()
+    general_log_probs = general_probs.clamp_min(1e-8).log()
+    forward_kl = (expert_probs * (expert_log_probs - general_log_probs)).sum(dim=1)
+    reverse_kl = (general_probs * (general_log_probs - expert_log_probs)).sum(dim=1)
+    same_prediction = expert_logits.argmax(dim=1).eq(general_logits.argmax(dim=1)).to(dtype=expert_logits.dtype)
+    dense_delta = general_features[:, :8] - expert_features[:, :8]
+    return torch.cat(
+        [
+            error_probs.view(-1, 1).to(dtype=expert_logits.dtype),
+            expert_features,
+            general_features,
+            dense_delta,
+            same_prediction.view(-1, 1),
+            forward_kl.view(-1, 1),
+            reverse_kl.view(-1, 1),
+        ],
+        dim=1,
+    )
 
 
 def _default_predictor_state(
@@ -569,6 +690,217 @@ def _fit_predictor_state(
     return state
 
 
+def _fit_weighted_binary_predictor_state(
+    features: torch.Tensor,
+    labels: torch.Tensor,
+    sample_weights: torch.Tensor,
+    device: torch.device,
+    epochs: int,
+    lr: float,
+    weight_decay: float,
+    hidden_dim: int = 0,
+    dropout: float = 0.0,
+) -> Dict[str, torch.Tensor]:
+    feature_dim = int(features.size(1)) if features.ndim == 2 else 1
+    hidden_dim = max(int(hidden_dim), 0)
+    if features.numel() == 0 or labels.numel() == 0 or sample_weights.numel() == 0:
+        return _default_predictor_state(feature_dim, hidden_dim=hidden_dim)
+
+    labels = labels.float().view(-1)
+    features = features.float()
+    sample_weights = sample_weights.float().view(-1).clamp_min(0.0)
+    active_mask = sample_weights > 0.0
+    if active_mask.sum().item() <= 0:
+        return _default_predictor_state(feature_dim, hidden_dim=hidden_dim)
+
+    features = features[active_mask]
+    labels = labels[active_mask]
+    sample_weights = sample_weights[active_mask]
+    positive_weighted = float((sample_weights * labels).sum().item())
+    negative_weighted = float((sample_weights * (1.0 - labels)).sum().item())
+    total_weighted = max(positive_weighted + negative_weighted, 1e-8)
+    positive_rate = positive_weighted / total_weighted
+    if positive_rate <= 1e-6 or positive_rate >= 1.0 - 1e-6:
+        return _default_predictor_state(feature_dim, error_rate=positive_rate, hidden_dim=hidden_dim)
+
+    mean = features.mean(dim=0)
+    std = features.std(dim=0, unbiased=False).clamp_min(1e-6)
+    normalized = (features - mean) / std
+
+    if hidden_dim > 0:
+        model = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(p=min(max(float(dropout), 0.0), 0.9)),
+            nn.Linear(hidden_dim, 1),
+        ).to(device)
+    else:
+        model = nn.Linear(feature_dim, 1).to(device)
+    pos_weight = torch.tensor([max(negative_weighted / max(positive_weighted, 1e-8), 1.0)], device=device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction="none")
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    batch_size = min(max(normalized.size(0), 1), 128)
+    x_all = normalized.to(device)
+    y_all = labels.to(device).unsqueeze(1)
+    w_all = sample_weights.to(device).unsqueeze(1)
+
+    for _ in range(max(int(epochs), 1)):
+        permutation = torch.randperm(x_all.size(0), device=device)
+        for start in range(0, x_all.size(0), batch_size):
+            indices = permutation[start:start + batch_size]
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(x_all[indices])
+            losses = criterion(logits, y_all[indices])
+            loss = (losses * w_all[indices]).sum() / w_all[indices].sum().clamp_min(1e-8)
+            loss.backward()
+            optimizer.step()
+
+    state = {
+        "mean": mean.detach().cpu().clone(),
+        "std": std.detach().cpu().clone(),
+    }
+    if hidden_dim > 0:
+        first_layer = model[0]
+        output_layer = model[3]
+        state.update(
+            {
+                "hidden_weight": first_layer.weight.detach().cpu().clone(),
+                "hidden_bias": first_layer.bias.detach().cpu().clone(),
+                "output_weight": output_layer.weight.detach().cpu().clone(),
+                "output_bias": output_layer.bias.detach().cpu().clone(),
+            }
+        )
+    else:
+        state.update(
+            {
+                "weight": model.weight.detach().cpu().clone(),
+                "bias": model.bias.detach().cpu().clone(),
+            }
+        )
+    return state
+
+
+def _select_top_rate_threshold(scores: torch.Tensor, rate: float, min_score: float = 0.0) -> float:
+    if scores.numel() == 0:
+        return 1.01
+    rate = min(max(float(rate), 0.0), 1.0)
+    if rate <= 0.0:
+        return 1.01
+    scores = scores.detach().to(dtype=torch.float32).view(-1)
+    candidate_count = min(max(int(math.ceil(scores.numel() * rate)), 1), int(scores.numel()))
+    sorted_scores, _ = torch.sort(scores, descending=True)
+    threshold = float(sorted_scores[candidate_count - 1].item())
+    return max(threshold, float(min_score))
+
+
+def _select_route_verifier_threshold(
+    scores: torch.Tensor,
+    rescue_mask: torch.Tensor,
+    harm_mask: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    config,
+) -> Tuple[float, Dict[str, float]]:
+    scores = scores.detach().to(dtype=torch.float32).view(-1)
+    rescue_mask = rescue_mask.detach().to(dtype=torch.bool).view(-1)
+    harm_mask = harm_mask.detach().to(dtype=torch.bool).view(-1)
+    candidate_mask = candidate_mask.detach().to(dtype=torch.bool).view(-1)
+    total = int(scores.numel())
+    stats = {
+        "samples": float(total),
+        "candidate": float(candidate_mask.sum().item()),
+        "adopted": 0.0,
+        "rescue": 0.0,
+        "harm": 0.0,
+        "net_rescue": 0.0,
+        "candidate_rate": float(candidate_mask.sum().item()) / max(total, 1),
+        "adopted_rate": 0.0,
+        "harm_rate": 0.0,
+        "rescue_harm_ratio": 0.0,
+        "selected_threshold": 1.01,
+        "disabled": 1.0,
+    }
+    if total <= 0 or not candidate_mask.any():
+        return 1.01, stats
+
+    mode = str(getattr(config.inference, "route_verifier_threshold_mode", "harm_constrained")).lower()
+    min_adopt_threshold = min(
+        max(float(getattr(config.inference, "route_verifier_min_adopt_threshold", 0.0)), 0.0),
+        1.0,
+    )
+    if mode in {"fixed", "manual"}:
+        threshold = max(float(getattr(config.inference, "route_verifier_threshold", 0.5)), min_adopt_threshold)
+        adopted = candidate_mask & scores.ge(threshold)
+        rescue = int((adopted & rescue_mask).sum().item())
+        harm = int((adopted & harm_mask).sum().item())
+        adopted_count = int(adopted.sum().item())
+        stats.update(
+            {
+                "adopted": float(adopted_count),
+                "rescue": float(rescue),
+                "harm": float(harm),
+                "net_rescue": float(rescue - harm),
+                "adopted_rate": adopted_count / max(total, 1),
+                "harm_rate": harm / max(total, 1),
+                "rescue_harm_ratio": rescue / max(harm, 1),
+                "selected_threshold": threshold,
+                "disabled": 0.0,
+            }
+        )
+        return threshold, stats
+
+    max_harm_rate = min(max(float(getattr(config.inference, "router_max_harm_rate", 0.01)), 0.0), 1.0)
+    min_ratio = max(float(getattr(config.inference, "router_min_rescue_harm_ratio", 1.0)), 0.0)
+    min_adopted = max(int(getattr(config.inference, "router_min_adopted", 3)), 1)
+    min_rescue = max(int(getattr(config.inference, "router_min_rescue", 1)), 0)
+    harm_lambda = max(float(getattr(config.inference, "route_verifier_harm_lambda", 1.0)), 0.0)
+
+    candidate_scores = scores[candidate_mask]
+    candidates = torch.unique(candidate_scores.clamp(0.0, 1.0)).tolist()
+    candidates.extend([min_adopt_threshold, 0.5, 1.0])
+    best_key: Optional[Tuple[float, int, int, int]] = None
+    best_threshold: Optional[float] = None
+    best_stats: Dict[str, float] = {}
+    for threshold in sorted({float(item) for item in candidates}):
+        if threshold < min_adopt_threshold:
+            continue
+        adopted = candidate_mask & scores.ge(threshold)
+        adopted_count = int(adopted.sum().item())
+        if adopted_count < min_adopted:
+            continue
+        rescue = int((adopted & rescue_mask).sum().item())
+        harm = int((adopted & harm_mask).sum().item())
+        if rescue < min_rescue:
+            continue
+        harm_rate = harm / max(total, 1)
+        if harm_rate > max_harm_rate:
+            continue
+        rescue_harm_ratio = rescue / max(harm, 1)
+        if rescue_harm_ratio < min_ratio:
+            continue
+        objective = rescue - (harm_lambda * harm)
+        key = (float(objective), rescue, -harm, adopted_count)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_threshold = float(threshold)
+            best_stats = {
+                "adopted": float(adopted_count),
+                "rescue": float(rescue),
+                "harm": float(harm),
+                "net_rescue": float(rescue - harm),
+                "adopted_rate": adopted_count / max(total, 1),
+                "harm_rate": harm_rate,
+                "rescue_harm_ratio": rescue_harm_ratio,
+                "selected_threshold": float(threshold),
+                "disabled": 0.0,
+            }
+
+    if best_threshold is None:
+        return 1.01, stats
+    stats.update(best_stats)
+    return best_threshold, stats
+
+
 class FedAsymClient(BaseFederatedClient):
     def __init__(
         self,
@@ -592,7 +924,11 @@ class FedAsymClient(BaseFederatedClient):
             base_channels=config.model.expert_base_channels,
         ).to(self.device)
         self.predictor_state = _default_predictor_state(
-            _predictor_feature_dim(num_classes),
+            _predictor_feature_dim(num_classes, tta_enabled=False),
+            hidden_dim=int(getattr(config.federated, "risk_predictor_hidden_dim", 32)),
+        )
+        self.candidate_predictor_state = _default_predictor_state(
+            _configured_predictor_feature_dim(config, num_classes),
             hidden_dim=int(getattr(config.federated, "risk_predictor_hidden_dim", 32)),
         )
         self.error_threshold = float(getattr(config.inference, "error_predictor_threshold", 0.5))
@@ -604,7 +940,11 @@ class FedAsymClient(BaseFederatedClient):
     ) -> FedAsymClientUpdate:
         distill_loss = self._distill_expert_on_public(public_batches, general_model)
         private_loss = self._train_expert_on_private()
-        self.predictor_state = self._fit_risk_predictor()
+        self.predictor_state = self._fit_risk_predictor(use_tta=False, update_error_threshold=True)
+        if _risk_predictor_tta_enabled(self.config):
+            self.candidate_predictor_state = self._fit_risk_predictor(use_tta=True, update_error_threshold=False)
+        else:
+            self.candidate_predictor_state = _clone_tensor_dict(self.predictor_state)
         public_logits = self._collect_public_logits(public_batches)
         loss_terms = [value for value in (distill_loss, private_loss) if value > 0.0]
         mean_loss = sum(loss_terms) / max(len(loss_terms), 1)
@@ -615,6 +955,7 @@ class FedAsymClient(BaseFederatedClient):
             public_logits=public_logits,
             predictor_state=_clone_tensor_dict(self.predictor_state),
             error_threshold=float(self.error_threshold),
+            candidate_predictor_state=_clone_tensor_dict(self.candidate_predictor_state),
         )
 
     def _distill_expert_on_public(
@@ -682,17 +1023,23 @@ class FedAsymClient(BaseFederatedClient):
             weight_decay=self.config.federated.local_weight_decay,
         )
 
-    def _fit_risk_predictor(self) -> Dict[str, torch.Tensor]:
+    def _fit_risk_predictor(
+        self,
+        use_tta: Optional[bool] = None,
+        update_error_threshold: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        tta_enabled = _risk_predictor_tta_enabled(self.config) if use_tta is None else bool(use_tta)
+        feature_dim = _predictor_feature_dim(self.num_classes, tta_enabled=tta_enabled)
         if self.calibration_dataset is None or len(self.calibration_dataset) == 0:
             return _default_predictor_state(
-                _predictor_feature_dim(self.num_classes),
+                feature_dim,
                 hidden_dim=int(getattr(self.config.federated, "risk_predictor_hidden_dim", 32)),
             )
 
-        features, labels = self._collect_predictor_features(self.calibration_dataset)
+        features, labels = self._collect_predictor_features(self.calibration_dataset, use_tta=tta_enabled)
         if features.numel() == 0 or labels.numel() == 0:
             return _default_predictor_state(
-                _predictor_feature_dim(self.num_classes),
+                feature_dim,
                 hidden_dim=int(getattr(self.config.federated, "risk_predictor_hidden_dim", 32)),
             )
 
@@ -718,7 +1065,12 @@ class FedAsymClient(BaseFederatedClient):
                 getattr(self.config.federated, "risk_predictor_hard_negative_warmup_epochs", 40)
             ),
         )
-        threshold_features, threshold_labels = self._collect_predictor_features(self.threshold_dataset)
+        if not update_error_threshold:
+            return predictor_state
+        threshold_features, threshold_labels = self._collect_predictor_features(
+            self.threshold_dataset,
+            use_tta=tta_enabled,
+        )
         if threshold_features.numel() == 0 or threshold_labels.numel() == 0:
             threshold_features, threshold_labels = features, labels
         error_probs = _predict_error_probabilities(predictor_state, threshold_features)
@@ -730,10 +1082,16 @@ class FedAsymClient(BaseFederatedClient):
         )
         return predictor_state
 
-    def _collect_predictor_features(self, dataset: Dataset) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _collect_predictor_features(
+        self,
+        dataset: Dataset,
+        use_tta: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        tta_enabled = _risk_predictor_tta_enabled(self.config) if use_tta is None else bool(use_tta)
+        feature_dim = _predictor_feature_dim(self.num_classes, tta_enabled=tta_enabled)
         if dataset is None or len(dataset) == 0:
             return (
-                torch.empty((0, _predictor_feature_dim(self.num_classes)), dtype=torch.float32),
+                torch.empty((0, feature_dim), dtype=torch.float32),
                 torch.empty((0,), dtype=torch.float32),
             )
 
@@ -747,14 +1105,17 @@ class FedAsymClient(BaseFederatedClient):
                 images = images.to(self.device)
                 targets_device = targets.to(self.device)
                 logits = self.expert_model(images)
-                features = _predictor_features_from_logits(logits)
+                if tta_enabled:
+                    features = _predictor_features_from_model(self.config, self.expert_model, images, logits)
+                else:
+                    features = _predictor_features_from_logits(logits)
                 predictions = logits.argmax(dim=1)
                 label_batches.append(predictions.ne(targets_device).float().cpu())
                 feature_batches.append(features.cpu())
 
         if not feature_batches:
             return (
-                torch.empty((0, _predictor_feature_dim(self.num_classes)), dtype=torch.float32),
+                torch.empty((0, feature_dim), dtype=torch.float32),
                 torch.empty((0,), dtype=torch.float32),
             )
         return torch.cat(feature_batches, dim=0), torch.cat(label_batches, dim=0)
@@ -765,6 +1126,15 @@ class FedAsymClient(BaseFederatedClient):
         with torch.no_grad():
             for batch in public_batches:
                 images = batch[0].to(self.device)
+                logits_batches.append(self.expert_model(images).detach().cpu())
+        return torch.cat(logits_batches, dim=0) if logits_batches else torch.empty((0, self.num_classes), dtype=torch.float32)
+
+    def _collect_public_tta_logits(self, public_batches: Sequence) -> torch.Tensor:
+        logits_batches: List[torch.Tensor] = []
+        self.expert_model.eval()
+        with torch.no_grad():
+            for batch in public_batches:
+                images = torch.flip(batch[0].to(self.device), dims=[-1])
                 logits_batches.append(self.expert_model(images).detach().cpu())
         return torch.cat(logits_batches, dim=0) if logits_batches else torch.empty((0, self.num_classes), dtype=torch.float32)
 
@@ -856,6 +1226,9 @@ class FedAsymServer(BaseFederatedServer):
         self.client_predictor_states: Dict[str, Dict[str, torch.Tensor]] = {
             client_id: _clone_tensor_dict(client.predictor_state) for client_id, client in self.clients.items()
         }
+        self.client_candidate_predictor_states: Dict[str, Dict[str, torch.Tensor]] = {
+            client_id: _clone_tensor_dict(client.candidate_predictor_state) for client_id, client in self.clients.items()
+        }
         self.client_error_thresholds: Dict[str, float] = {
             client_id: float(getattr(config.inference, "error_predictor_threshold", 0.5))
             for client_id in client_datasets
@@ -867,6 +1240,27 @@ class FedAsymServer(BaseFederatedServer):
         self.client_route_group_blocklists: Dict[str, List[int]] = {}
         self.client_route_group_thresholds: Dict[str, Dict[int, float]] = {}
         self.client_route_group_threshold_boosts: Dict[str, Dict[int, float]] = {}
+        self.client_route_candidate_thresholds: Dict[str, float] = {
+            client_id: 1.01 for client_id in client_datasets
+        }
+        self.client_route_candidate_bin_thresholds: Dict[str, Dict[int, float]] = {
+            client_id: {} for client_id in client_datasets
+        }
+        self.client_route_verifier_states: Dict[str, Dict[str, torch.Tensor]] = {
+            client_id: _default_predictor_state(
+                _route_verifier_feature_dim(config.model.num_classes),
+                hidden_dim=int(getattr(config.inference, "route_verifier_hidden_dim", 32)),
+            )
+            for client_id in client_datasets
+        }
+        self.client_route_verifier_thresholds: Dict[str, float] = {
+            client_id: 1.01 for client_id in client_datasets
+        }
+        self.client_route_verifier_bin_thresholds: Dict[str, Dict[int, float]] = {
+            client_id: {} for client_id in client_datasets
+        }
+        self.client_route_verifier_stats: Dict[str, Dict[str, float]] = {}
+        self.client_route_verifier_bin_stats: Dict[str, Dict[int, Dict[str, float]]] = {}
         self.last_history: List[RoundMetrics] = []
         self.best_snapshot: Optional[Dict[str, object]] = None
         self.loaded_checkpoint_path: Optional[str] = None
@@ -877,9 +1271,57 @@ class FedAsymServer(BaseFederatedServer):
         self,
         predictor_state: Dict[str, torch.Tensor],
         public_logits: torch.Tensor,
+        public_tta_logits: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        features = _predictor_features_from_logits(public_logits)
+        features = _predictor_features_from_logits_with_tta(public_logits, public_tta_logits)
         return _predict_error_probabilities(predictor_state, features)
+
+    def _candidate_predictor_state(self, client_id: str) -> Dict[str, torch.Tensor]:
+        return self.client_candidate_predictor_states.get(
+            client_id,
+            self.client_predictor_states[client_id],
+        )
+
+    def _base_predictor_features(self, logits: torch.Tensor) -> torch.Tensor:
+        return _predictor_features_from_logits(logits)
+
+    def _candidate_predictor_features(
+        self,
+        model: nn.Module,
+        images: torch.Tensor,
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
+        if not _risk_predictor_tta_enabled(self.config):
+            return _predictor_features_from_logits(logits)
+        return _predictor_features_from_model(self.config, model, images, logits)
+
+    def _router_candidate_tta_weight(self) -> float:
+        if not _risk_predictor_tta_enabled(self.config):
+            return 0.0
+        return min(max(float(getattr(self.config.inference, "router_candidate_tta_weight", 0.25)), 0.0), 1.0)
+
+    def _candidate_error_probabilities(
+        self,
+        client_id: str,
+        model: nn.Module,
+        images: torch.Tensor,
+        logits: torch.Tensor,
+        base_features: torch.Tensor,
+        base_error_probs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        tta_weight = self._router_candidate_tta_weight()
+        if tta_weight <= 0.0:
+            return base_error_probs, base_features
+
+        candidate_features = self._candidate_predictor_features(model, images, logits)
+        tta_error_probs = _predict_error_probabilities(
+            self._candidate_predictor_state(client_id),
+            candidate_features,
+        )
+        if tta_weight >= 1.0:
+            return tta_error_probs, candidate_features
+        mixed_error_probs = ((1.0 - tta_weight) * base_error_probs) + (tta_weight * tta_error_probs)
+        return mixed_error_probs.clamp(0.0, 1.0), candidate_features
 
     def _aggregate_public_knowledge(self, updates: List[FedAsymClientUpdate]) -> Dict[str, torch.Tensor | float]:
         if not updates:
@@ -893,7 +1335,10 @@ class FedAsymServer(BaseFederatedServer):
         all_logits = []
         all_reliabilities = []
         for update in updates:
-            error_probs = self._predict_public_error_probabilities(update.predictor_state, update.public_logits)
+            error_probs = self._predict_public_error_probabilities(
+                update.predictor_state,
+                update.public_logits,
+            )
             reliability = (1.0 - error_probs).clamp(1e-4, 1.0)
             all_logits.append(update.public_logits)
             all_reliabilities.append(reliability.cpu())
@@ -1015,7 +1460,406 @@ class FedAsymServer(BaseFederatedServer):
             logits = self.clients[client_id].expert_model(images)
         return logits.argmax(dim=1), 0
 
+    def _two_stage_routing_enabled(self) -> bool:
+        policy = str(getattr(self.config.inference, "routing_policy", "")).lower()
+        return policy in {
+            "two_stage_error_verifier",
+            "two-stage-error-verifier",
+            "two_stage",
+            "candidate_verifier",
+            "error_predictor_verifier",
+        }
+
+    def _confidence_bin_count(self) -> int:
+        return len(self._router_diagnostic_confidence_edges()) + 1
+
+    def _confidence_bin_label_by_index(self, bin_index: int) -> str:
+        edges = self._router_diagnostic_confidence_edges()
+        index = int(bin_index)
+        if index <= 0:
+            return f"<{edges[0]:.2f}" if edges else "all"
+        if index >= len(edges):
+            return f">={edges[-1]:.2f}" if edges else "all"
+        return f"{edges[index - 1]:.2f}-{edges[index]:.2f}"
+
+    def _confidence_bin_indices(self, confidence: torch.Tensor) -> torch.Tensor:
+        bins = torch.zeros_like(confidence, dtype=torch.long)
+        for edge in self._router_diagnostic_confidence_edges():
+            bins = bins + confidence.ge(float(edge)).to(dtype=torch.long)
+        return bins
+
+    def _candidate_confidence_bins_enabled(self) -> bool:
+        return bool(getattr(self.config.inference, "router_candidate_confidence_bins_enabled", False))
+
+    def _route_verifier_confidence_bins_enabled(self) -> bool:
+        return bool(getattr(self.config.inference, "route_verifier_confidence_bin_thresholds_enabled", False))
+
+    def _route_fusion_confidence_alpha_enabled(self) -> bool:
+        return bool(getattr(self.config.inference, "route_fusion_confidence_alpha_enabled", False))
+
+    def _candidate_confidence_bin_rates(self, default_rate: float) -> List[float]:
+        raw_rates = _parse_float_list(getattr(self.config.inference, "router_candidate_confidence_bin_rates", []))
+        bin_count = self._confidence_bin_count()
+        rates: List[float] = []
+        for bin_index in range(bin_count):
+            rate = raw_rates[bin_index] if bin_index < len(raw_rates) else default_rate
+            rates.append(min(max(float(rate), 0.0), 1.0))
+        return rates
+
+    def _fusion_confidence_alpha_max_values(self, default_max: float) -> List[float]:
+        raw_values = _parse_float_list(getattr(self.config.inference, "route_fusion_confidence_alpha_max_values", []))
+        bin_count = self._confidence_bin_count()
+        values: List[float] = []
+        for bin_index in range(bin_count):
+            value = raw_values[bin_index] if bin_index < len(raw_values) else default_max
+            values.append(min(max(float(value), 0.0), 1.0))
+        return values
+
+    def _select_candidate_thresholds_by_confidence(
+        self,
+        scores: torch.Tensor,
+        confidence: torch.Tensor,
+        default_rate: float,
+        min_score: float,
+    ) -> Dict[int, float]:
+        if scores.numel() == 0 or confidence.numel() == 0:
+            return {bin_index: 1.01 for bin_index in range(self._confidence_bin_count())}
+        scores = scores.detach().to(dtype=torch.float32).view(-1)
+        confidence = confidence.detach().to(dtype=torch.float32).view(-1)
+        bins = self._confidence_bin_indices(confidence)
+        rates = self._candidate_confidence_bin_rates(default_rate)
+        thresholds: Dict[int, float] = {}
+        for bin_index, rate in enumerate(rates):
+            bin_mask = bins.eq(int(bin_index))
+            if bin_mask.any():
+                thresholds[int(bin_index)] = _select_top_rate_threshold(scores[bin_mask], rate, min_score=min_score)
+            else:
+                thresholds[int(bin_index)] = 1.01
+        return thresholds
+
+    def _candidate_thresholds_for_batch(
+        self,
+        client_id: str,
+        expert_features: torch.Tensor,
+    ) -> torch.Tensor:
+        base_threshold = float(self.client_route_candidate_thresholds.get(client_id, 1.01))
+        thresholds = torch.full(
+            (expert_features.size(0),),
+            base_threshold,
+            device=expert_features.device,
+            dtype=expert_features.dtype,
+        )
+        if not self._candidate_confidence_bins_enabled():
+            return thresholds
+        bin_thresholds = self.client_route_candidate_bin_thresholds.get(client_id, {})
+        if not bin_thresholds:
+            return thresholds
+        bins = self._confidence_bin_indices(expert_features[:, 0])
+        for bin_index, threshold in bin_thresholds.items():
+            thresholds[bins.eq(int(bin_index))] = float(threshold)
+        return thresholds
+
+    def _candidate_mask_from_scores_and_confidence(
+        self,
+        client_id: str,
+        scores: torch.Tensor,
+        confidence: torch.Tensor,
+    ) -> torch.Tensor:
+        base_threshold = float(self.client_route_candidate_thresholds.get(client_id, 1.01))
+        thresholds = torch.full_like(scores, base_threshold, dtype=torch.float32)
+        if self._candidate_confidence_bins_enabled():
+            bin_thresholds = self.client_route_candidate_bin_thresholds.get(client_id, {})
+            bins = self._confidence_bin_indices(confidence.to(dtype=torch.float32))
+            for bin_index, threshold in bin_thresholds.items():
+                thresholds[bins.eq(int(bin_index))] = float(threshold)
+        return scores.to(dtype=torch.float32).ge(thresholds)
+
+    def _route_verifier_thresholds_for_batch(
+        self,
+        client_id: str,
+        expert_features: torch.Tensor,
+    ) -> torch.Tensor:
+        base_threshold = float(self.client_route_verifier_thresholds.get(client_id, 1.01))
+        thresholds = torch.full(
+            (expert_features.size(0),),
+            base_threshold,
+            device=expert_features.device,
+            dtype=expert_features.dtype,
+        )
+        if not self._route_verifier_confidence_bins_enabled():
+            return thresholds
+        bin_thresholds = self.client_route_verifier_bin_thresholds.get(client_id, {})
+        if not bin_thresholds:
+            return thresholds
+        bins = self._confidence_bin_indices(expert_features[:, 0])
+        for bin_index, threshold in bin_thresholds.items():
+            thresholds[bins.eq(int(bin_index))] = float(threshold)
+        return thresholds
+
+    def _passes_route_verifier_validation_filter(
+        self,
+        threshold_stats: Dict[str, float],
+        min_validation_adopted: int,
+        min_validation_net: float,
+        min_validation_ratio: float,
+    ) -> Tuple[bool, Dict[str, float]]:
+        validation_adopted = float(threshold_stats.get("adopted", 0.0))
+        validation_net = float(threshold_stats.get("net_rescue", 0.0))
+        validation_ratio = float(threshold_stats.get("rescue_harm_ratio", 0.0))
+        adopted_fail = validation_adopted < float(min_validation_adopted)
+        net_fail = validation_net < min_validation_net
+        ratio_fail = validation_ratio < min_validation_ratio
+        validation_fail = adopted_fail or net_fail or ratio_fail
+        return not validation_fail, {
+            "disabled_by_validation": float(validation_fail),
+            "disabled_by_validation_adopted": float(adopted_fail),
+            "disabled_by_validation_net": float(net_fail),
+            "disabled_by_validation_ratio": float(ratio_fail),
+        }
+
+    def _disabled_route_verifier_stats(self, threshold_stats: Dict[str, float]) -> Dict[str, float]:
+        disabled_stats = dict(threshold_stats)
+        disabled_stats.update(
+            {
+                "candidate": 0.0,
+                "adopted": 0.0,
+                "rescue": 0.0,
+                "harm": 0.0,
+                "net_rescue": 0.0,
+                "candidate_rate": 0.0,
+                "adopted_rate": 0.0,
+                "harm_rate": 0.0,
+                "rescue_harm_ratio": 0.0,
+                "selected_threshold": 1.01,
+                "disabled": 1.0,
+            }
+        )
+        return disabled_stats
+
+    def _aggregate_route_verifier_bin_stats(
+        self,
+        bin_stats: Dict[int, Dict[str, float]],
+    ) -> Dict[str, float]:
+        stats = self._default_route_verifier_stats()
+        if not bin_stats:
+            return stats
+        stats["samples"] = float(sum(item.get("samples", 0.0) for item in bin_stats.values()))
+        stats["candidate"] = float(sum(item.get("candidate", 0.0) for item in bin_stats.values()))
+        stats["adopted"] = float(sum(item.get("adopted", 0.0) for item in bin_stats.values()))
+        stats["rescue"] = float(sum(item.get("rescue", 0.0) for item in bin_stats.values()))
+        stats["harm"] = float(sum(item.get("harm", 0.0) for item in bin_stats.values()))
+        stats["net_rescue"] = float(stats["rescue"] - stats["harm"])
+        stats["candidate_rate"] = stats["candidate"] / max(stats["samples"], 1.0)
+        stats["adopted_rate"] = stats["adopted"] / max(stats["samples"], 1.0)
+        stats["harm_rate"] = stats["harm"] / max(stats["samples"], 1.0)
+        stats["rescue_harm_ratio"] = stats["rescue"] / max(stats["harm"], 1.0)
+        enabled_thresholds = [
+            float(item.get("selected_threshold", 1.01))
+            for item in bin_stats.values()
+            if float(item.get("disabled", 1.0)) <= 0.0
+        ]
+        stats["selected_threshold"] = sum(enabled_thresholds) / max(len(enabled_thresholds), 1) if enabled_thresholds else 1.01
+        stats["disabled"] = float(not enabled_thresholds)
+        stats["disabled_by_validation"] = float(not enabled_thresholds)
+        stats["disabled_by_validation_adopted"] = float(
+            sum(item.get("disabled_by_validation_adopted", 0.0) for item in bin_stats.values()) > 0.0
+        )
+        stats["disabled_by_validation_net"] = float(
+            sum(item.get("disabled_by_validation_net", 0.0) for item in bin_stats.values()) > 0.0
+        )
+        stats["disabled_by_validation_ratio"] = float(
+            sum(item.get("disabled_by_validation_ratio", 0.0) for item in bin_stats.values()) > 0.0
+        )
+        return stats
+
+    def _build_two_stage_candidate_mask(
+        self,
+        client_id: str,
+        error_probs: torch.Tensor,
+        expert_features: torch.Tensor,
+    ) -> torch.Tensor:
+        candidate_thresholds = self._candidate_thresholds_for_batch(client_id, expert_features)
+        candidate_mask = error_probs >= candidate_thresholds
+        disable_guard = bool(getattr(self.config.inference, "router_candidate_disable_high_confidence_guard", True))
+        if not disable_guard:
+            guard = _high_confidence_guard(self.config)
+            if guard < 1.0:
+                candidate_mask = candidate_mask & expert_features[:, 0].lt(guard)
+        return candidate_mask
+
+    def _score_route_verifier(
+        self,
+        client_id: str,
+        expert_logits: torch.Tensor,
+        general_logits: torch.Tensor,
+        error_probs: torch.Tensor,
+    ) -> torch.Tensor:
+        state = self.client_route_verifier_states.get(client_id)
+        if state is None:
+            return torch.zeros(expert_logits.size(0), device=expert_logits.device, dtype=expert_logits.dtype)
+        features = _route_verifier_features_from_logits(expert_logits, general_logits, error_probs)
+        return _predict_error_probabilities(state, features)
+
+    def _route_verifier_uses_fusion(self) -> bool:
+        mode = str(getattr(self.config.inference, "route_verifier_adoption_mode", "hard")).lower()
+        return mode in {"fusion", "soft_fusion", "soft-fusion", "prob_mix", "prob-mix"}
+
+    def _route_fusion_alpha(
+        self,
+        error_probs: torch.Tensor,
+        verifier_scores: torch.Tensor,
+        adopt_threshold: float | torch.Tensor,
+        expert_confidence: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        alpha_min = min(max(float(getattr(self.config.inference, "route_fusion_alpha_min", 0.35)), 0.0), 1.0)
+        alpha_max = min(max(float(getattr(self.config.inference, "route_fusion_alpha_max", 0.85)), alpha_min), 1.0)
+        alpha_fixed = min(max(float(getattr(self.config.inference, "route_fusion_alpha_fixed", 0.50)), 0.0), 1.0)
+        source = str(getattr(self.config.inference, "route_fusion_alpha_source", "verifier")).lower()
+        if source in {"fixed", "constant"}:
+            return torch.full_like(error_probs, alpha_fixed)
+        if source in {"error", "error_prob", "error-prob", "risk"}:
+            base = error_probs.clamp(0.0, 1.0)
+        elif source in {"mean", "average", "avg"}:
+            verifier_base = verifier_scores.clamp(0.0, 1.0)
+            base = 0.5 * (error_probs.clamp(0.0, 1.0) + verifier_base)
+        else:
+            if isinstance(adopt_threshold, torch.Tensor):
+                threshold_tensor = adopt_threshold.to(device=verifier_scores.device, dtype=verifier_scores.dtype)
+            else:
+                threshold_tensor = torch.full_like(verifier_scores, float(adopt_threshold))
+            denominator = (1.0 - threshold_tensor).clamp_min(1e-6)
+            base = ((verifier_scores - threshold_tensor) / denominator).clamp(0.0, 1.0)
+        alpha = alpha_min + ((alpha_max - alpha_min) * base)
+        if self._route_fusion_confidence_alpha_enabled() and expert_confidence is not None:
+            max_values = self._fusion_confidence_alpha_max_values(alpha_max)
+            bins = self._confidence_bin_indices(expert_confidence.to(device=alpha.device, dtype=alpha.dtype))
+            alpha_max_by_bin = torch.full_like(alpha, alpha_max)
+            for bin_index, alpha_cap in enumerate(max_values):
+                alpha_max_by_bin[bins.eq(int(bin_index))] = float(alpha_cap)
+            alpha = torch.minimum(alpha, alpha_max_by_bin)
+        return alpha
+
+    def _predict_routed_two_stage_impl(self, client_id, images, indices, full_metadata: bool = False):
+        expert_model = self.clients[client_id].expert_model
+        predictor_state = self.client_predictor_states[client_id]
+
+        expert_model.eval()
+        self.general_model.eval()
+        with torch.no_grad():
+            expert_logits = expert_model(images)
+            expert_features = self._base_predictor_features(expert_logits)
+            verifier_error_probs = _predict_error_probabilities(predictor_state, expert_features)
+            error_probs, candidate_features = self._candidate_error_probabilities(
+                client_id,
+                expert_model,
+                images,
+                expert_logits,
+                expert_features,
+                verifier_error_probs,
+            )
+            expert_probs = torch.softmax(expert_logits, dim=1)
+            expert_prediction = expert_logits.argmax(dim=1)
+            candidate_mask = self._build_two_stage_candidate_mask(client_id, error_probs, candidate_features)
+
+            predictions = expert_prediction.clone()
+            route_types = ["expert"] * images.size(0)
+            general_prediction = torch.full_like(expert_prediction, -1)
+            verifier_scores = torch.zeros_like(error_probs)
+            fusion_alpha = torch.zeros_like(error_probs)
+            adopted_mask = torch.zeros_like(candidate_mask)
+            candidate_count = int(candidate_mask.sum().item())
+            candidate_thresholds = self._candidate_thresholds_for_batch(client_id, candidate_features)
+            adopt_thresholds = self._route_verifier_thresholds_for_batch(client_id, expert_features)
+            use_fusion = self._route_verifier_uses_fusion()
+
+            if full_metadata:
+                general_logits = self.general_model(images)
+                general_prediction = general_logits.argmax(dim=1)
+                if candidate_mask.any():
+                    verifier_scores = self._score_route_verifier(client_id, expert_logits, general_logits, verifier_error_probs)
+                    adopted_mask = candidate_mask & verifier_scores.ge(adopt_thresholds)
+                    if adopted_mask.any():
+                        if use_fusion:
+                            alpha = self._route_fusion_alpha(
+                                verifier_error_probs[adopted_mask],
+                                verifier_scores[adopted_mask],
+                                adopt_thresholds[adopted_mask],
+                                expert_confidence=expert_features[adopted_mask, 0],
+                            )
+                            fusion_alpha[adopted_mask] = alpha
+                            general_probs = torch.softmax(general_logits[adopted_mask], dim=1)
+                            expert_probs_adopted = expert_probs[adopted_mask]
+                            fused_probs = ((1.0 - alpha).unsqueeze(1) * expert_probs_adopted) + (
+                                alpha.unsqueeze(1) * general_probs
+                            )
+                            predictions[adopted_mask] = fused_probs.argmax(dim=1)
+                        else:
+                            predictions[adopted_mask] = general_prediction[adopted_mask]
+            elif candidate_mask.any():
+                candidate_indices = candidate_mask.nonzero(as_tuple=False).flatten()
+                general_logits_candidate = self.general_model(images[candidate_mask])
+                general_prediction[candidate_mask] = general_logits_candidate.argmax(dim=1)
+                verifier_scores_candidate = self._score_route_verifier(
+                    client_id,
+                    expert_logits[candidate_mask],
+                    general_logits_candidate,
+                    verifier_error_probs[candidate_mask],
+                )
+                verifier_scores[candidate_mask] = verifier_scores_candidate
+                candidate_adopt_thresholds = adopt_thresholds[candidate_indices]
+                adopted_candidates = verifier_scores_candidate.ge(candidate_adopt_thresholds)
+                if adopted_candidates.any():
+                    adopted_indices = candidate_indices[adopted_candidates]
+                    adopted_mask[adopted_indices] = True
+                    if use_fusion:
+                        alpha = self._route_fusion_alpha(
+                            verifier_error_probs[adopted_indices],
+                            verifier_scores_candidate[adopted_candidates],
+                            candidate_adopt_thresholds[adopted_candidates],
+                            expert_confidence=expert_features[adopted_indices, 0],
+                        )
+                        fusion_alpha[adopted_indices] = alpha
+                        general_probs = torch.softmax(general_logits_candidate[adopted_candidates], dim=1)
+                        expert_probs_adopted = expert_probs[adopted_indices]
+                        fused_probs = ((1.0 - alpha).unsqueeze(1) * expert_probs_adopted) + (
+                            alpha.unsqueeze(1) * general_probs
+                        )
+                        predictions[adopted_indices] = fused_probs.argmax(dim=1)
+                    else:
+                        predictions[adopted_indices] = general_prediction[adopted_indices]
+
+            if candidate_mask.any():
+                for sample_index in candidate_mask.nonzero(as_tuple=False).flatten().tolist():
+                    route_types[sample_index] = "candidate"
+            if adopted_mask.any():
+                for sample_index in adopted_mask.nonzero(as_tuple=False).flatten().tolist():
+                    route_types[sample_index] = "fusion" if use_fusion else "general"
+
+            metadata = {
+                "route_type": route_types,
+                "expert_confidence": expert_probs.max(dim=1).values.detach().cpu().tolist(),
+                "expert_margin": expert_features[:, 2].detach().cpu().tolist(),
+                "expert_entropy": expert_features[:, 1].detach().cpu().tolist(),
+                "error_prob": error_probs.detach().cpu().tolist(),
+                "verifier_error_prob": verifier_error_probs.detach().cpu().tolist(),
+                "error_threshold": candidate_thresholds.detach().cpu().tolist(),
+                "expert_pred": expert_prediction.detach().cpu().tolist(),
+                "route_candidate": candidate_mask.detach().cpu().to(torch.int64).tolist(),
+                "route_adopted": adopted_mask.detach().cpu().to(torch.int64).tolist(),
+                "route_verifier_score": verifier_scores.detach().cpu().tolist(),
+                "route_verifier_threshold": adopt_thresholds.detach().cpu().tolist(),
+                "route_fusion_alpha": fusion_alpha.detach().cpu().tolist(),
+                "route_confidence_bin": self._confidence_bin_indices(expert_features[:, 0]).detach().cpu().tolist(),
+                "route_adoption_mode": ["fusion" if use_fusion else "hard"] * images.size(0),
+            }
+            if full_metadata:
+                metadata["general_pred"] = general_prediction.detach().cpu().tolist()
+            return predictions, candidate_count, metadata
+
     def _predict_routed_impl(self, client_id, images, indices, full_metadata: bool = False):
+        if self._two_stage_routing_enabled():
+            return self._predict_routed_two_stage_impl(client_id, images, indices, full_metadata=full_metadata)
+
         expert_model = self.clients[client_id].expert_model
         predictor_state = self.client_predictor_states[client_id]
         threshold = float(self.client_error_thresholds.get(client_id, getattr(self.config.inference, "error_predictor_threshold", 0.5)))
@@ -1024,7 +1868,7 @@ class FedAsymServer(BaseFederatedServer):
         self.general_model.eval()
         with torch.no_grad():
             expert_logits = expert_model(images)
-            expert_features = _predictor_features_from_logits(expert_logits)
+            expert_features = self._base_predictor_features(expert_logits)
             error_probs = _predict_error_probabilities(predictor_state, expert_features)
             expert_probs = torch.softmax(expert_logits, dim=1)
             expert_prediction = expert_logits.argmax(dim=1)
@@ -1673,6 +2517,7 @@ class FedAsymServer(BaseFederatedServer):
             predictor_expert=self._predict_expert_only,
             predictor_general=self._predict_general_only,
             predictor_routed=self._predict_routed,
+            general_route_types=("general", "fusion"),
         )
 
     def _evaluate_error_predictor_metrics(self) -> Dict[str, float]:
@@ -1701,19 +2546,34 @@ class FedAsymServer(BaseFederatedServer):
                     images = images.to(self.device)
                     targets_device = targets.to(self.device)
                     expert_logits = expert_model(images)
-                    features = _predictor_features_from_logits(expert_logits)
-                    error_probs = _predict_error_probabilities(predictor_state, features)
+                    expert_features = self._base_predictor_features(expert_logits)
+                    base_error_probs = _predict_error_probabilities(predictor_state, expert_features)
+                    if self._two_stage_routing_enabled():
+                        error_probs, features = self._candidate_error_probabilities(
+                            client_id,
+                            expert_model,
+                            images,
+                            expert_logits,
+                            expert_features,
+                            base_error_probs,
+                        )
+                    else:
+                        features = expert_features
+                        error_probs = base_error_probs
                     expert_predictions = expert_logits.argmax(dim=1)
                     batch_error_labels = expert_predictions.ne(targets_device)
-                    batch_predicted_positive = _build_error_fallback_mask(error_probs, features, threshold, self.config)
-                    batch_predicted_positive = self._apply_route_group_filter(
-                        client_id,
-                        batch_predicted_positive,
-                        expert_predictions,
-                        error_probs,
-                        threshold,
-                        features,
-                    )
+                    if self._two_stage_routing_enabled():
+                        batch_predicted_positive = self._build_two_stage_candidate_mask(client_id, error_probs, features)
+                    else:
+                        batch_predicted_positive = _build_error_fallback_mask(error_probs, features, threshold, self.config)
+                        batch_predicted_positive = self._apply_route_group_filter(
+                            client_id,
+                            batch_predicted_positive,
+                            expert_predictions,
+                            error_probs,
+                            threshold,
+                            features,
+                        )
 
                     predicted_positive += int(batch_predicted_positive.sum().item())
                     true_positive += int((batch_predicted_positive & batch_error_labels).sum().item())
@@ -1886,7 +2746,7 @@ class FedAsymServer(BaseFederatedServer):
                     images = images.to(self.device)
                     targets_device = targets.to(self.device)
                     expert_logits = expert_model(images)
-                    features = _predictor_features_from_logits(expert_logits)
+                    features = self._base_predictor_features(expert_logits)
                     error_probs = _predict_error_probabilities(predictor_state, features)
                     raw_positive = error_probs >= threshold
                     expert_predictions = expert_logits.argmax(dim=1)
@@ -1979,15 +2839,359 @@ class FedAsymServer(BaseFederatedServer):
             "router_diag_high_confidence_recall": float(high_confidence_recall),
         }
 
+    def _router_regret_diagnostics_enabled(self) -> bool:
+        return bool(getattr(self.config.inference, "router_regret_diagnostics_enabled", False))
+
+    def _router_candidate_diagnostics_enabled(self) -> bool:
+        return bool(getattr(self.config.inference, "router_candidate_diagnostics_enabled", False))
+
+    def _router_candidate_rates(self) -> List[float]:
+        raw_rates = getattr(self.config.inference, "router_candidate_rates", [0.01, 0.02, 0.05, 0.10, 0.15, 0.20])
+        if isinstance(raw_rates, str):
+            parts = [part.strip() for part in raw_rates.split(",")]
+        else:
+            try:
+                parts = list(raw_rates)
+            except TypeError:
+                parts = [raw_rates]
+        rates: List[float] = []
+        for part in parts:
+            try:
+                rate = float(part)
+            except (TypeError, ValueError):
+                continue
+            if 0.0 < rate <= 1.0:
+                rates.append(rate)
+        return sorted(set(rates))
+
+    @staticmethod
+    def _router_candidate_rate_label(rate: float) -> str:
+        percent = rate * 100.0
+        if abs(percent - round(percent)) < 1e-6:
+            return f"top{int(round(percent))}"
+        return "top" + f"{percent:.1f}".replace(".", "p")
+
+    @staticmethod
+    def _router_regret_bucket() -> Dict[str, float]:
+        return {
+            "samples": 0.0,
+            "expert_errors": 0.0,
+            "oracle_positive": 0.0,
+            "routed": 0.0,
+            "rescue": 0.0,
+            "missed_rescue": 0.0,
+            "harm": 0.0,
+            "neutral_call": 0.0,
+            "both_correct_call": 0.0,
+            "both_wrong_call": 0.0,
+        }
+
+    def _log_router_regret_bucket(self, label: str, key: str, bucket: Dict[str, float]) -> None:
+        samples = float(bucket.get("samples", 0.0))
+        oracle_positive = float(bucket.get("oracle_positive", 0.0))
+        routed = float(bucket.get("routed", 0.0))
+        rescue = float(bucket.get("rescue", 0.0))
+        missed_rescue = float(bucket.get("missed_rescue", 0.0))
+        harm = float(bucket.get("harm", 0.0))
+        LOGGER.info(
+            "%s router regret %s=%s"
+            " | n=%d | errors=%d | oracle_pos=%d | oracle_pos_rate=%.4f"
+            " | routed=%d | routed_rate=%.4f"
+            " | rescue=%d | missed=%d | harm=%d | neutral=%d"
+            " | both_correct_call=%d | both_wrong_call=%d"
+            " | oracle_capture=%.4f | missed_rate=%.4f | harm_rate=%.4f | regret_rate=%.4f",
+            self.algorithm_name,
+            label,
+            key,
+            int(samples),
+            int(bucket.get("expert_errors", 0.0)),
+            int(oracle_positive),
+            oracle_positive / max(samples, 1.0),
+            int(routed),
+            routed / max(samples, 1.0),
+            int(rescue),
+            int(missed_rescue),
+            int(harm),
+            int(bucket.get("neutral_call", 0.0)),
+            int(bucket.get("both_correct_call", 0.0)),
+            int(bucket.get("both_wrong_call", 0.0)),
+            rescue / max(oracle_positive, 1.0),
+            missed_rescue / max(samples, 1.0),
+            harm / max(samples, 1.0),
+            (missed_rescue + harm) / max(samples, 1.0),
+        )
+
+    def _evaluate_router_oracle_diagnostics(self) -> Dict[str, float]:
+        regret_enabled = self._router_regret_diagnostics_enabled()
+        candidate_enabled = self._router_candidate_diagnostics_enabled()
+        if not regret_enabled and not candidate_enabled:
+            return {}
+
+        confidence_edges = self._router_diagnostic_confidence_edges()
+        summary_bucket = self._router_regret_bucket()
+        confidence_buckets: Dict[str, Dict[str, float]] = {}
+
+        score_batches: List[torch.Tensor] = []
+        oracle_positive_batches: List[torch.Tensor] = []
+        harm_candidate_batches: List[torch.Tensor] = []
+        both_correct_batches: List[torch.Tensor] = []
+        both_wrong_batches: List[torch.Tensor] = []
+        expert_correct_batches: List[torch.Tensor] = []
+        general_correct_batches: List[torch.Tensor] = []
+
+        total_samples = 0
+        expert_correct_total = 0
+        general_correct_total = 0
+        routed_correct_total = 0
+        oracle_correct_total = 0
+        disagreement_total = 0
+        two_stage_candidate_total = 0
+        two_stage_enabled = self._two_stage_routing_enabled()
+
+        self.general_model.eval()
+        with torch.no_grad():
+            for client_id, dataset in self.client_test_datasets.items():
+                predictor_state = self.client_predictor_states.get(client_id)
+                if predictor_state is None:
+                    continue
+                threshold = float(
+                    self.client_error_thresholds.get(
+                        client_id,
+                        getattr(self.config.inference, "error_predictor_threshold", 0.5),
+                    )
+                )
+                expert_model = self.clients[client_id].expert_model
+                expert_model.eval()
+                loader = self.data_module.make_loader(dataset, shuffle=False)
+
+                for images, targets, _ in loader:
+                    images = images.to(self.device)
+                    targets_device = targets.to(self.device)
+
+                    expert_logits = expert_model(images)
+                    expert_features = self._base_predictor_features(expert_logits)
+                    verifier_error_probs = _predict_error_probabilities(predictor_state, expert_features)
+                    expert_predictions = expert_logits.argmax(dim=1)
+
+                    general_logits = self.general_model(images)
+                    general_predictions = general_logits.argmax(dim=1)
+                    if two_stage_enabled:
+                        error_probs, candidate_features = self._candidate_error_probabilities(
+                            client_id,
+                            expert_model,
+                            images,
+                            expert_logits,
+                            expert_features,
+                            verifier_error_probs,
+                        )
+                        candidate_mask = self._build_two_stage_candidate_mask(client_id, error_probs, candidate_features)
+                        verifier_scores = self._score_route_verifier(
+                            client_id,
+                            expert_logits,
+                            general_logits,
+                            verifier_error_probs,
+                        )
+                        adopt_thresholds = self._route_verifier_thresholds_for_batch(client_id, expert_features)
+                        routed_mask = candidate_mask & verifier_scores.ge(adopt_thresholds)
+                        two_stage_candidate_total += int(candidate_mask.sum().item())
+                    else:
+                        base_fallback_mask = _build_error_fallback_mask(
+                            verifier_error_probs,
+                            expert_features,
+                            threshold,
+                            self.config,
+                        )
+                        routed_mask = self._apply_route_group_filter(
+                            client_id,
+                            base_fallback_mask,
+                            expert_predictions,
+                            verifier_error_probs,
+                            threshold,
+                            expert_features,
+                        )
+                    expert_correct = expert_predictions.eq(targets_device)
+                    general_correct = general_predictions.eq(targets_device)
+                    if two_stage_enabled and self._route_verifier_uses_fusion() and routed_mask.any():
+                        alpha = self._route_fusion_alpha(
+                            verifier_error_probs[routed_mask],
+                            verifier_scores[routed_mask],
+                            adopt_thresholds[routed_mask],
+                            expert_confidence=expert_features[routed_mask, 0],
+                        )
+                        fused_probs = ((1.0 - alpha).unsqueeze(1) * torch.softmax(expert_logits[routed_mask], dim=1)) + (
+                            alpha.unsqueeze(1) * torch.softmax(general_logits[routed_mask], dim=1)
+                        )
+                        route_correct = torch.zeros_like(expert_correct, dtype=torch.bool)
+                        route_correct[routed_mask] = fused_probs.argmax(dim=1).eq(targets_device[routed_mask])
+                    else:
+                        route_correct = general_correct
+                    expert_error = ~expert_correct
+                    oracle_positive = expert_error & general_correct
+                    harm_candidate = expert_correct & (~general_correct)
+                    rescue = routed_mask & expert_error & route_correct
+                    missed_rescue = oracle_positive & (~rescue)
+                    harm = routed_mask & expert_correct & (~route_correct)
+                    both_correct = expert_correct & general_correct
+                    both_wrong = (~expert_correct) & (~general_correct)
+                    neutral_call = routed_mask & (~rescue) & (~harm)
+                    routed_correct = torch.where(routed_mask, route_correct, expert_correct)
+
+                    batch_size = int(targets_device.numel())
+                    total_samples += batch_size
+                    expert_correct_total += int(expert_correct.sum().item())
+                    general_correct_total += int(general_correct.sum().item())
+                    routed_correct_total += int(routed_correct.sum().item())
+                    oracle_correct_total += int((expert_correct | general_correct).sum().item())
+                    disagreement_total += int(expert_predictions.ne(general_predictions).sum().item())
+
+                    summary_bucket["samples"] += float(batch_size)
+                    summary_bucket["expert_errors"] += float(expert_error.sum().item())
+                    summary_bucket["oracle_positive"] += float(oracle_positive.sum().item())
+                    summary_bucket["routed"] += float(routed_mask.sum().item())
+                    summary_bucket["rescue"] += float(rescue.sum().item())
+                    summary_bucket["missed_rescue"] += float(missed_rescue.sum().item())
+                    summary_bucket["harm"] += float(harm.sum().item())
+                    summary_bucket["neutral_call"] += float(neutral_call.sum().item())
+                    summary_bucket["both_correct_call"] += float((routed_mask & both_correct).sum().item())
+                    summary_bucket["both_wrong_call"] += float((routed_mask & both_wrong).sum().item())
+
+                    if regret_enabled:
+                        confidence = expert_features[:, 0]
+                        for sample_index in range(batch_size):
+                            confidence_bin = self._router_confidence_bin(
+                                float(confidence[sample_index].item()),
+                                confidence_edges,
+                            )
+                            bucket = confidence_buckets.setdefault(confidence_bin, self._router_regret_bucket())
+                            bucket["samples"] += 1.0
+                            bucket["expert_errors"] += float(expert_error[sample_index].item())
+                            bucket["oracle_positive"] += float(oracle_positive[sample_index].item())
+                            bucket["routed"] += float(routed_mask[sample_index].item())
+                            bucket["rescue"] += float(rescue[sample_index].item())
+                            bucket["missed_rescue"] += float(missed_rescue[sample_index].item())
+                            bucket["harm"] += float(harm[sample_index].item())
+                            bucket["neutral_call"] += float(neutral_call[sample_index].item())
+                            bucket["both_correct_call"] += float((routed_mask & both_correct)[sample_index].item())
+                            bucket["both_wrong_call"] += float((routed_mask & both_wrong)[sample_index].item())
+
+                    if candidate_enabled:
+                        score_batches.append(error_probs.detach().cpu().to(torch.float32))
+                        oracle_positive_batches.append(oracle_positive.detach().cpu())
+                        harm_candidate_batches.append(harm_candidate.detach().cpu())
+                        both_correct_batches.append(both_correct.detach().cpu())
+                        both_wrong_batches.append(both_wrong.detach().cpu())
+                        expert_correct_batches.append(expert_correct.detach().cpu())
+                        general_correct_batches.append(general_correct.detach().cpu())
+
+        metrics: Dict[str, float] = {}
+        samples = float(max(total_samples, 1))
+        oracle_positive_total = float(summary_bucket.get("oracle_positive", 0.0))
+        rescue_total = float(summary_bucket.get("rescue", 0.0))
+        missed_rescue_total = float(summary_bucket.get("missed_rescue", 0.0))
+        harm_total = float(summary_bucket.get("harm", 0.0))
+        routed_total = float(summary_bucket.get("routed", 0.0))
+        metrics.update(
+            {
+                "router_regret_rescue": rescue_total,
+                "router_regret_harm": harm_total,
+                "router_regret_missed_rescue": missed_rescue_total,
+                "router_regret_neutral_call": float(summary_bucket.get("neutral_call", 0.0)),
+                "router_regret_rescue_rate": rescue_total / samples,
+                "router_regret_harm_rate": harm_total / samples,
+                "router_regret_missed_rescue_rate": missed_rescue_total / samples,
+                "router_regret_rate_from_masks": (missed_rescue_total + harm_total) / samples,
+                "router_oracle_positive_rate": oracle_positive_total / samples,
+                "router_current_route_rate_from_masks": routed_total / samples,
+                "router_oracle_capture_rate": rescue_total / max(oracle_positive_total, 1.0),
+                "router_oracle_accuracy_from_masks": oracle_correct_total / samples,
+                "router_routed_accuracy_from_masks": routed_correct_total / samples,
+                "router_expert_accuracy_from_masks": expert_correct_total / samples,
+                "router_general_accuracy_from_masks": general_correct_total / samples,
+                "router_expert_general_disagreement_from_masks": disagreement_total / samples,
+                "router_two_stage_candidate_rate_from_masks": two_stage_candidate_total / samples if two_stage_enabled else 0.0,
+                "router_two_stage_adopted_rate_from_masks": routed_total / samples if two_stage_enabled else 0.0,
+            }
+        )
+
+        if regret_enabled:
+            self._log_router_regret_bucket("summary", "all", summary_bucket)
+            for confidence_bin, bucket in sorted(confidence_buckets.items()):
+                self._log_router_regret_bucket("confidence", confidence_bin, bucket)
+
+        if candidate_enabled and score_batches:
+            scores = torch.cat(score_batches, dim=0)
+            oracle_positive = torch.cat(oracle_positive_batches, dim=0).to(dtype=torch.bool)
+            harm_candidate = torch.cat(harm_candidate_batches, dim=0).to(dtype=torch.bool)
+            both_correct = torch.cat(both_correct_batches, dim=0).to(dtype=torch.bool)
+            both_wrong = torch.cat(both_wrong_batches, dim=0).to(dtype=torch.bool)
+            expert_correct = torch.cat(expert_correct_batches, dim=0).to(dtype=torch.bool)
+            general_correct = torch.cat(general_correct_batches, dim=0).to(dtype=torch.bool)
+            order = torch.argsort(scores, descending=True)
+            total = int(scores.numel())
+            total_oracle_positive = int(oracle_positive.sum().item())
+            for rate in self._router_candidate_rates():
+                candidate_size = min(max(int(math.ceil(total * rate)), 1), total)
+                selected = order[:candidate_size]
+                candidate_oracle_positive = int(oracle_positive[selected].sum().item())
+                candidate_harm = int(harm_candidate[selected].sum().item())
+                candidate_both_correct = int(both_correct[selected].sum().item())
+                candidate_both_wrong = int(both_wrong[selected].sum().item())
+                candidate_expert_correct = int(expert_correct[selected].sum().item())
+                candidate_general_correct = int(general_correct[selected].sum().item())
+                candidate_hard_correct = expert_correct.clone()
+                candidate_hard_correct[selected] = general_correct[selected]
+                candidate_hard_accuracy = float(candidate_hard_correct.to(torch.float32).mean().item())
+                capture = candidate_oracle_positive / max(total_oracle_positive, 1)
+                net = candidate_oracle_positive - candidate_harm
+                label = self._router_candidate_rate_label(rate)
+                metrics.update(
+                    {
+                        f"router_candidate_{label}_rate": candidate_size / max(total, 1),
+                        f"router_candidate_{label}_capture": capture,
+                        f"router_candidate_{label}_oracle_positive": float(candidate_oracle_positive),
+                        f"router_candidate_{label}_harm": float(candidate_harm),
+                        f"router_candidate_{label}_net": float(net),
+                        f"router_candidate_{label}_both_correct": float(candidate_both_correct),
+                        f"router_candidate_{label}_both_wrong": float(candidate_both_wrong),
+                        f"router_candidate_{label}_expert_acc": candidate_expert_correct / max(candidate_size, 1),
+                        f"router_candidate_{label}_general_acc": candidate_general_correct / max(candidate_size, 1),
+                        f"router_candidate_{label}_hard_general_acc": candidate_hard_accuracy,
+                    }
+                )
+                LOGGER.info(
+                    "%s router candidate dryrun rate=%.4f"
+                    " | k=%d | capture=%.4f | oracle_pos=%d/%d"
+                    " | harm=%d | net=%d | both_correct=%d | both_wrong=%d"
+                    " | candidate_expert_acc=%.4f | candidate_general_acc=%.4f"
+                    " | hard_general_acc=%.4f",
+                    self.algorithm_name,
+                    rate,
+                    candidate_size,
+                    capture,
+                    candidate_oracle_positive,
+                    total_oracle_positive,
+                    candidate_harm,
+                    net,
+                    candidate_both_correct,
+                    candidate_both_wrong,
+                    candidate_expert_correct / max(candidate_size, 1),
+                    candidate_general_correct / max(candidate_size, 1),
+                    candidate_hard_accuracy,
+                )
+
+        return metrics
+
     def _build_round_extra_metrics(
         self,
         expert_eval: Dict[str, object],
         general_eval: Dict[str, object],
         routed_eval: Dict[str, object],
+        include_oracle_diagnostics: bool = False,
     ) -> Dict[str, float]:
         metrics = self._evaluate_route_effectiveness_metrics(expert_eval, general_eval, routed_eval)
         predictor_metrics = self._evaluate_error_predictor_metrics()
         router_diagnostics = self._evaluate_router_diagnostics()
+        oracle_diagnostics = self._evaluate_router_oracle_diagnostics() if include_oracle_diagnostics else {}
         threshold_mean = (
             sum(self.client_error_thresholds.values()) / max(len(self.client_error_thresholds), 1)
             if self.client_error_thresholds
@@ -2036,10 +3240,51 @@ class FedAsymServer(BaseFederatedServer):
         route_group_blocked_net_rescue = sum(
             float(item.get("net_rescue", 0.0)) for item in route_group_stats if item.get("blocked", 0.0) > 0.0
         )
+        verifier_stats = list(self.client_route_verifier_stats.values())
+        verifier_enabled_rate = (
+            sum(1 for item in verifier_stats if item.get("disabled", 1.0) <= 0.0) / max(len(verifier_stats), 1)
+            if verifier_stats
+            else 0.0
+        )
+        verifier_candidate_rate = (
+            sum(float(item.get("candidate_rate", 0.0)) for item in verifier_stats) / max(len(verifier_stats), 1)
+            if verifier_stats
+            else 0.0
+        )
+        verifier_adopted_rate = (
+            sum(float(item.get("adopted_rate", 0.0)) for item in verifier_stats) / max(len(verifier_stats), 1)
+            if verifier_stats
+            else 0.0
+        )
+        verifier_rescue = sum(float(item.get("rescue", 0.0)) for item in verifier_stats)
+        verifier_harm = sum(float(item.get("harm", 0.0)) for item in verifier_stats)
+        verifier_candidate_threshold = (
+            sum(float(item.get("candidate_threshold", 1.01)) for item in verifier_stats) / max(len(verifier_stats), 1)
+            if verifier_stats
+            else 0.0
+        )
+        verifier_adopt_threshold = (
+            sum(float(item.get("selected_threshold", 1.01)) for item in verifier_stats) / max(len(verifier_stats), 1)
+            if verifier_stats
+            else 0.0
+        )
+        verifier_validation_disabled_rate = (
+            sum(1 for item in verifier_stats if item.get("disabled_by_validation", 0.0) > 0.0)
+            / max(len(verifier_stats), 1)
+            if verifier_stats
+            else 0.0
+        )
+        verifier_train_harm_guard_disabled_rate = (
+            sum(1 for item in verifier_stats if item.get("disabled_by_train_harm_guard", 0.0) > 0.0)
+            / max(len(verifier_stats), 1)
+            if verifier_stats
+            else 0.0
+        )
         metrics.update(
             {
                 **predictor_metrics,
                 **router_diagnostics,
+                **oracle_diagnostics,
                 "distill_loss": self.latest_distill_stats.get("total_loss", 0.0),
                 "dkdr_forward_kl": self.latest_distill_stats.get("forward_kl", 0.0),
                 "dkdr_reverse_kl": self.latest_distill_stats.get("reverse_kl", 0.0),
@@ -2059,6 +3304,16 @@ class FedAsymServer(BaseFederatedServer):
                 "route_group_filter_blocked_net_rescue": float(route_group_blocked_net_rescue),
                 "route_group_filter_lowered_classes": float(route_group_lowered),
                 "route_group_filter_boosted_classes": float(route_group_boosted),
+                "route_verifier_enabled_rate": float(verifier_enabled_rate),
+                "route_verifier_candidate_rate": float(verifier_candidate_rate),
+                "route_verifier_adopted_rate": float(verifier_adopted_rate),
+                "route_verifier_rescue": float(verifier_rescue),
+                "route_verifier_harm": float(verifier_harm),
+                "route_verifier_net_rescue": float(verifier_rescue - verifier_harm),
+                "route_verifier_candidate_threshold_mean": float(verifier_candidate_threshold),
+                "route_verifier_adopt_threshold_mean": float(verifier_adopt_threshold),
+                "route_verifier_validation_disabled_rate": float(verifier_validation_disabled_rate),
+                "route_verifier_train_harm_guard_disabled_rate": float(verifier_train_harm_guard_disabled_rate),
             }
         )
         return metrics
@@ -2080,6 +3335,10 @@ class FedAsymServer(BaseFederatedServer):
             f" | rgf_gain={extra_metrics.get('route_gain_filter_mean_gain', 0.0):.4f}"
             f" | rgg_on={extra_metrics.get('route_group_filter_enabled_classes', 0.0):.0f}"
             f" | rgg_disable={extra_metrics.get('route_group_filter_disabled_rate', 0.0):.4f}"
+            f" | rv_cand={extra_metrics.get('route_verifier_candidate_rate', 0.0):.4f}"
+            f" | rv_adopt={extra_metrics.get('route_verifier_adopted_rate', 0.0):.4f}"
+            f" | rv_net={extra_metrics.get('route_verifier_net_rescue', 0.0):.0f}"
+            f" | rv_val_disable={extra_metrics.get('route_verifier_validation_disabled_rate', 0.0):.4f}"
             f" | dkdr_f={extra_metrics.get('dkdr_forward_kl', 0.0):.4f}"
             f" | dkdr_r={extra_metrics.get('dkdr_reverse_kl', 0.0):.4f}"
             f" | gam_f={extra_metrics.get('dkdr_gamma_forward', 0.5):.4f}"
@@ -2106,6 +3365,10 @@ class FedAsymServer(BaseFederatedServer):
             "client_predictor_states": {
                 client_id: _clone_tensor_dict(state) for client_id, state in self.client_predictor_states.items()
             },
+            "client_candidate_predictor_states": {
+                client_id: _clone_tensor_dict(state)
+                for client_id, state in self.client_candidate_predictor_states.items()
+            },
             "client_error_thresholds": dict(self.client_error_thresholds),
             "client_raw_error_thresholds": dict(self.client_raw_error_thresholds),
             "client_route_group_allowlists": {
@@ -2117,6 +3380,15 @@ class FedAsymServer(BaseFederatedServer):
             "client_route_group_thresholds": copy.deepcopy(self.client_route_group_thresholds),
             "client_route_group_threshold_boosts": copy.deepcopy(self.client_route_group_threshold_boosts),
             "client_route_group_stats": copy.deepcopy(self.client_route_group_stats),
+            "client_route_candidate_thresholds": dict(self.client_route_candidate_thresholds),
+            "client_route_candidate_bin_thresholds": copy.deepcopy(self.client_route_candidate_bin_thresholds),
+            "client_route_verifier_states": {
+                client_id: _clone_tensor_dict(state) for client_id, state in self.client_route_verifier_states.items()
+            },
+            "client_route_verifier_thresholds": dict(self.client_route_verifier_thresholds),
+            "client_route_verifier_bin_thresholds": copy.deepcopy(self.client_route_verifier_bin_thresholds),
+            "client_route_verifier_stats": copy.deepcopy(self.client_route_verifier_stats),
+            "client_route_verifier_bin_stats": copy.deepcopy(self.client_route_verifier_bin_stats),
             "latest_distill_stats": dict(self.latest_distill_stats),
         }
         LOGGER.info(
@@ -2187,7 +3459,7 @@ class FedAsymServer(BaseFederatedServer):
                     images = images.to(self.device)
                     targets_device = targets.to(self.device)
                     logits = expert_model(images)
-                    features = _predictor_features_from_logits(logits)
+                    features = self._base_predictor_features(logits)
                     predictions = logits.argmax(dim=1)
                     feature_batches.append(features.cpu())
                     label_batches.append(predictions.ne(targets_device).cpu())
@@ -2222,9 +3494,15 @@ class FedAsymServer(BaseFederatedServer):
     def _retrain_route_predictors(self) -> None:
         updated_thresholds: Dict[str, float] = {}
         for client_id, client in self.clients.items():
-            predictor_state = client._fit_risk_predictor()
+            predictor_state = client._fit_risk_predictor(use_tta=False, update_error_threshold=True)
             client.predictor_state = _clone_tensor_dict(predictor_state)
             self.client_predictor_states[client_id] = _clone_tensor_dict(predictor_state)
+            if _risk_predictor_tta_enabled(self.config):
+                candidate_predictor_state = client._fit_risk_predictor(use_tta=True, update_error_threshold=False)
+            else:
+                candidate_predictor_state = _clone_tensor_dict(predictor_state)
+            client.candidate_predictor_state = _clone_tensor_dict(candidate_predictor_state)
+            self.client_candidate_predictor_states[client_id] = _clone_tensor_dict(candidate_predictor_state)
             raw_threshold = float(client.error_threshold)
             self.client_raw_error_thresholds[client_id] = raw_threshold
             updated_thresholds[client_id], stats = self._calibrate_client_route_gain(client_id, raw_threshold)
@@ -2239,6 +3517,399 @@ class FedAsymServer(BaseFederatedServer):
         self._log_route_gain_filter_details("retrain")
         self._refresh_route_group_filters(context="retrain")
 
+    def _empty_route_verifier_data(self) -> Dict[str, torch.Tensor]:
+        feature_dim = _route_verifier_feature_dim(self.config.model.num_classes)
+        return {
+            "features": torch.empty((0, feature_dim), dtype=torch.float32),
+            "error_probs": torch.empty((0,), dtype=torch.float32),
+            "confidence": torch.empty((0,), dtype=torch.float32),
+            "rescue": torch.empty((0,), dtype=torch.bool),
+            "harm": torch.empty((0,), dtype=torch.bool),
+            "neutral": torch.empty((0,), dtype=torch.bool),
+        }
+
+    def _collect_route_verifier_data(self, client_id: str, dataset: Dataset) -> Dict[str, torch.Tensor]:
+        if dataset is None or len(dataset) == 0:
+            return self._empty_route_verifier_data()
+
+        predictor_state = self.client_predictor_states.get(client_id)
+        if predictor_state is None:
+            return self._empty_route_verifier_data()
+
+        expert_model = self.clients[client_id].expert_model
+        expert_model.eval()
+        self.general_model.eval()
+        feature_batches: List[torch.Tensor] = []
+        score_batches: List[torch.Tensor] = []
+        confidence_batches: List[torch.Tensor] = []
+        rescue_batches: List[torch.Tensor] = []
+        harm_batches: List[torch.Tensor] = []
+        neutral_batches: List[torch.Tensor] = []
+        loader = self.data_module.make_loader(dataset, shuffle=False)
+        with torch.no_grad():
+            for images, targets, _ in loader:
+                images = images.to(self.device)
+                targets_device = targets.to(self.device)
+                expert_logits = expert_model(images)
+                expert_features = self._base_predictor_features(expert_logits)
+                verifier_error_probs = _predict_error_probabilities(predictor_state, expert_features)
+                error_probs, _ = self._candidate_error_probabilities(
+                    client_id,
+                    expert_model,
+                    images,
+                    expert_logits,
+                    expert_features,
+                    verifier_error_probs,
+                )
+                general_logits = self.general_model(images)
+                route_features = _route_verifier_features_from_logits(
+                    expert_logits,
+                    general_logits,
+                    verifier_error_probs,
+                )
+
+                expert_correct = expert_logits.argmax(dim=1).eq(targets_device)
+                general_correct = general_logits.argmax(dim=1).eq(targets_device)
+                rescue = (~expert_correct) & general_correct
+                harm = expert_correct & (~general_correct)
+                neutral = ~(rescue | harm)
+
+                feature_batches.append(route_features.detach().cpu())
+                score_batches.append(error_probs.detach().cpu())
+                confidence_batches.append(expert_features[:, 0].detach().cpu())
+                rescue_batches.append(rescue.detach().cpu())
+                harm_batches.append(harm.detach().cpu())
+                neutral_batches.append(neutral.detach().cpu())
+
+        if not feature_batches:
+            return self._empty_route_verifier_data()
+        return {
+            "features": torch.cat(feature_batches, dim=0).to(dtype=torch.float32),
+            "error_probs": torch.cat(score_batches, dim=0).to(dtype=torch.float32),
+            "confidence": torch.cat(confidence_batches, dim=0).to(dtype=torch.float32),
+            "rescue": torch.cat(rescue_batches, dim=0).to(dtype=torch.bool),
+            "harm": torch.cat(harm_batches, dim=0).to(dtype=torch.bool),
+            "neutral": torch.cat(neutral_batches, dim=0).to(dtype=torch.bool),
+        }
+
+    def _default_route_verifier_stats(self) -> Dict[str, float]:
+        return {
+            "samples": 0.0,
+            "train_samples": 0.0,
+            "candidate": 0.0,
+            "adopted": 0.0,
+            "rescue": 0.0,
+            "harm": 0.0,
+            "net_rescue": 0.0,
+            "candidate_rate": 0.0,
+            "adopted_rate": 0.0,
+            "harm_rate": 0.0,
+            "rescue_harm_ratio": 0.0,
+            "candidate_threshold": 1.01,
+            "selected_threshold": 1.01,
+            "train_candidate": 0.0,
+            "train_rescue": 0.0,
+            "train_harm": 0.0,
+            "train_neutral": 0.0,
+            "disabled": 1.0,
+            "disabled_by_validation": 0.0,
+            "disabled_by_validation_adopted": 0.0,
+            "disabled_by_validation_net": 0.0,
+            "disabled_by_validation_ratio": 0.0,
+            "disabled_by_train_harm_guard": 0.0,
+        }
+
+    def _refresh_route_verifiers(self, client_ids: Optional[Sequence[str]] = None, context: str = "refresh") -> None:
+        if not self._two_stage_routing_enabled():
+            self.client_route_verifier_stats = {}
+            self.client_route_verifier_bin_stats = {}
+            return
+
+        target_client_ids = list(client_ids) if client_ids is not None else list(self.clients.keys())
+        candidate_rate = min(max(float(getattr(self.config.inference, "router_candidate_rate", 0.10)), 0.0), 1.0)
+        candidate_min_score = min(max(float(getattr(self.config.inference, "router_candidate_min_score", 0.0)), 0.0), 1.0)
+        hidden_dim = max(int(getattr(self.config.inference, "route_verifier_hidden_dim", 32)), 0)
+        dropout = min(max(float(getattr(self.config.inference, "route_verifier_dropout", 0.10)), 0.0), 0.9)
+        epochs = max(int(getattr(self.config.inference, "route_verifier_epochs", 60)), 1)
+        lr = float(getattr(self.config.inference, "route_verifier_lr", 0.001))
+        weight_decay = float(getattr(self.config.inference, "route_verifier_weight_decay", 0.0))
+        negative_weight = max(float(getattr(self.config.inference, "route_verifier_negative_weight", 2.0)), 0.0)
+        neutral_weight = max(float(getattr(self.config.inference, "route_verifier_neutral_weight", 0.0)), 0.0)
+        min_validation_adopted = max(
+            int(getattr(self.config.inference, "route_verifier_min_validation_adopted", 0)),
+            0,
+        )
+        bin_min_validation_adopted = max(
+            int(getattr(self.config.inference, "route_verifier_bin_min_validation_adopted", min_validation_adopted)),
+            0,
+        )
+        min_validation_net = float(getattr(self.config.inference, "route_verifier_min_validation_net", 0.0))
+        min_validation_ratio = max(
+            float(getattr(self.config.inference, "route_verifier_min_validation_rescue_harm_ratio", 1.0)),
+            0.0,
+        )
+        min_adopt_threshold = min(
+            max(float(getattr(self.config.inference, "route_verifier_min_adopt_threshold", 0.0)), 0.0),
+            1.0,
+        )
+        low_threshold_train_harm_ratio = max(
+            float(getattr(self.config.inference, "route_verifier_low_threshold_train_harm_ratio", 0.0)),
+            0.0,
+        )
+        low_threshold_train_harm_min_candidates = max(
+            int(getattr(self.config.inference, "route_verifier_low_threshold_train_harm_min_candidates", 10)),
+            1,
+        )
+        disable_on_validation_fail = bool(
+            getattr(self.config.inference, "route_verifier_disable_on_validation_fail", True)
+        )
+
+        enabled = 0
+        total_candidate_rate = 0.0
+        total_adopted_rate = 0.0
+        for client_id in target_client_ids:
+            stats = self._default_route_verifier_stats()
+            train_data = self._collect_route_verifier_data(client_id, self.client_router_train_datasets.get(client_id))
+            validation_data = self._collect_route_verifier_data(client_id, self.client_calibration_datasets.get(client_id))
+            score_source = validation_data["error_probs"] if validation_data["error_probs"].numel() > 0 else train_data["error_probs"]
+            confidence_source = (
+                validation_data["confidence"] if validation_data["confidence"].numel() > 0 else train_data["confidence"]
+            )
+            candidate_threshold = _select_top_rate_threshold(score_source, candidate_rate, min_score=candidate_min_score)
+            self.client_route_candidate_thresholds[client_id] = candidate_threshold
+            if self._candidate_confidence_bins_enabled():
+                self.client_route_candidate_bin_thresholds[client_id] = self._select_candidate_thresholds_by_confidence(
+                    score_source,
+                    confidence_source,
+                    candidate_rate,
+                    min_score=candidate_min_score,
+                )
+            else:
+                self.client_route_candidate_bin_thresholds[client_id] = {}
+            stats["candidate_threshold"] = float(candidate_threshold)
+            stats["train_samples"] = float(train_data["error_probs"].numel())
+
+            train_candidate = self._candidate_mask_from_scores_and_confidence(
+                client_id,
+                train_data["error_probs"],
+                train_data["confidence"],
+            )
+            train_rescue = train_data["rescue"] & train_candidate
+            train_harm = train_data["harm"] & train_candidate
+            train_neutral = train_data["neutral"] & train_candidate
+            stats["train_candidate"] = float(train_candidate.sum().item())
+            stats["train_rescue"] = float(train_rescue.sum().item())
+            stats["train_harm"] = float(train_harm.sum().item())
+            stats["train_neutral"] = float(train_neutral.sum().item())
+
+            labels = train_rescue.to(dtype=torch.float32)
+            weights = torch.zeros_like(labels, dtype=torch.float32)
+            weights[train_rescue] = 1.0
+            weights[train_harm] = negative_weight
+            if neutral_weight > 0.0:
+                weights[train_neutral] = neutral_weight
+
+            if train_data["features"].numel() > 0 and weights.sum().item() > 0.0:
+                verifier_state = _fit_weighted_binary_predictor_state(
+                    features=train_data["features"],
+                    labels=labels,
+                    sample_weights=weights,
+                    device=self.device,
+                    epochs=epochs,
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    hidden_dim=hidden_dim,
+                    dropout=dropout,
+                )
+            else:
+                verifier_state = _default_predictor_state(
+                    _route_verifier_feature_dim(self.config.model.num_classes),
+                    hidden_dim=hidden_dim,
+                )
+            self.client_route_verifier_states[client_id] = _clone_tensor_dict(verifier_state)
+
+            validation_scores = validation_data["error_probs"]
+            validation_candidate = self._candidate_mask_from_scores_and_confidence(
+                client_id,
+                validation_scores,
+                validation_data["confidence"],
+            )
+            self.client_route_verifier_bin_thresholds[client_id] = {}
+            self.client_route_verifier_bin_stats[client_id] = {}
+            if validation_data["features"].numel() > 0:
+                verifier_scores = _predict_error_probabilities(verifier_state, validation_data["features"])
+                if self._route_verifier_confidence_bins_enabled():
+                    bins = self._confidence_bin_indices(validation_data["confidence"])
+                    bin_thresholds: Dict[int, float] = {}
+                    bin_stats_map: Dict[int, Dict[str, float]] = {}
+                    candidate_bin_thresholds = dict(self.client_route_candidate_bin_thresholds.get(client_id, {}))
+                    for bin_index in range(self._confidence_bin_count()):
+                        bin_mask = bins.eq(int(bin_index))
+                        if bin_mask.any():
+                            bin_candidate = validation_candidate & bin_mask
+                            bin_threshold, bin_stats = _select_route_verifier_threshold(
+                                scores=verifier_scores,
+                                rescue_mask=validation_data["rescue"],
+                                harm_mask=validation_data["harm"],
+                                candidate_mask=bin_candidate,
+                                config=self.config,
+                            )
+                            bin_stats["samples"] = float(bin_mask.sum().item())
+                        else:
+                            bin_threshold, bin_stats = 1.01, self._default_route_verifier_stats()
+                        bin_stats["confidence_bin"] = float(bin_index)
+                        bin_stats["candidate_threshold"] = float(
+                            candidate_bin_thresholds.get(bin_index, candidate_threshold)
+                        )
+                        bin_stats["confidence_bin_label"] = self._confidence_bin_label_by_index(bin_index)
+                        passes_filter, filter_stats = self._passes_route_verifier_validation_filter(
+                            bin_stats,
+                            bin_min_validation_adopted,
+                            min_validation_net,
+                            min_validation_ratio,
+                        )
+                        bin_stats.update(filter_stats)
+                        if disable_on_validation_fail and not passes_filter:
+                            bin_threshold = 1.01
+                            bin_stats = self._disabled_route_verifier_stats(bin_stats)
+                            bin_stats.update(filter_stats)
+                            bin_stats["confidence_bin"] = float(bin_index)
+                            bin_stats["confidence_bin_label"] = self._confidence_bin_label_by_index(bin_index)
+                            bin_stats["candidate_threshold"] = float(
+                                candidate_bin_thresholds.get(bin_index, candidate_threshold)
+                            )
+                        bin_thresholds[bin_index] = float(bin_threshold)
+                        bin_stats["selected_threshold"] = float(bin_threshold)
+                        bin_stats_map[bin_index] = bin_stats
+                    self.client_route_candidate_bin_thresholds[client_id] = candidate_bin_thresholds
+                    self.client_route_verifier_bin_thresholds[client_id] = bin_thresholds
+                    self.client_route_verifier_bin_stats[client_id] = bin_stats_map
+                    adopt_threshold = 1.01
+                    threshold_stats = self._aggregate_route_verifier_bin_stats(bin_stats_map)
+                else:
+                    adopt_threshold, threshold_stats = _select_route_verifier_threshold(
+                        scores=verifier_scores,
+                        rescue_mask=validation_data["rescue"],
+                        harm_mask=validation_data["harm"],
+                        candidate_mask=validation_candidate,
+                        config=self.config,
+                    )
+            else:
+                adopt_threshold, threshold_stats = 1.01, self._default_route_verifier_stats()
+            self.client_route_verifier_thresholds[client_id] = float(adopt_threshold)
+            stats.update(threshold_stats)
+            stats["candidate_threshold"] = float(candidate_threshold)
+            train_harm_guard_failed = False
+            if (
+                low_threshold_train_harm_ratio > 0.0
+                and float(stats.get("selected_threshold", 1.01)) <= min_adopt_threshold + 1e-8
+                and float(stats.get("train_candidate", 0.0)) >= float(low_threshold_train_harm_min_candidates)
+            ):
+                train_rescue_count = float(stats.get("train_rescue", 0.0))
+                train_harm_count = float(stats.get("train_harm", 0.0))
+                train_harm_guard_failed = train_harm_count > max(train_rescue_count * low_threshold_train_harm_ratio, 0.0)
+            stats["disabled_by_train_harm_guard"] = float(train_harm_guard_failed)
+            if not self._route_verifier_confidence_bins_enabled():
+                passes_filter, filter_stats = self._passes_route_verifier_validation_filter(
+                    stats,
+                    min_validation_adopted,
+                    min_validation_net,
+                    min_validation_ratio,
+                )
+                stats.update(filter_stats)
+                if disable_on_validation_fail and (not passes_filter or train_harm_guard_failed):
+                    self.client_route_verifier_thresholds[client_id] = 1.01
+                    stats["selected_threshold"] = 1.01
+                    stats["disabled"] = 1.0
+            self.client_route_verifier_stats[client_id] = stats
+            enabled += int(float(stats.get("disabled", 1.0)) <= 0.0)
+            total_candidate_rate += float(stats.get("candidate_rate", 0.0))
+            total_adopted_rate += float(stats.get("adopted_rate", 0.0))
+
+        divisor = max(len(target_client_ids), 1)
+        LOGGER.info(
+            "%s route verifier %s | clients=%d | enabled=%d | candidate_rate=%.4f | adopted_rate=%.4f",
+            self.algorithm_name,
+            context,
+            len(target_client_ids),
+            enabled,
+            total_candidate_rate / divisor,
+            total_adopted_rate / divisor,
+        )
+        self._log_route_verifier_details(context, target_client_ids)
+
+    def _log_route_verifier_details(self, context: str, client_ids: Optional[Sequence[str]] = None) -> None:
+        if not self._two_stage_routing_enabled() or not self.client_route_verifier_stats:
+            return
+        target_client_ids = list(client_ids) if client_ids is not None else sorted(self.client_route_verifier_stats.keys())
+        for client_id in target_client_ids:
+            stats = self.client_route_verifier_stats.get(client_id)
+            if not stats:
+                continue
+            LOGGER.info(
+                "%s route verifier %s client=%s"
+                " | disabled=%d | cand_thr=%.4f | adopt_thr=%.4f"
+                " | n=%d | cand=%d | adopt=%d | cand_rate=%.4f | adopt_rate=%.4f"
+                " | rescue=%d | harm=%d | net=%d | harm_rate=%.4f | rescue_harm=%.4f"
+                " | val_fail=%d | val_adopt_fail=%d | val_net_fail=%d | val_ratio_fail=%d | train_harm_guard=%d"
+                " | train_n=%d | train_cand=%d | train_rescue=%d | train_harm=%d | train_neutral=%d",
+                self.algorithm_name,
+                context,
+                client_id,
+                int(stats.get("disabled", 1.0) > 0.0),
+                float(stats.get("candidate_threshold", 1.01)),
+                float(stats.get("selected_threshold", 1.01)),
+                int(stats.get("samples", 0.0)),
+                int(stats.get("candidate", 0.0)),
+                int(stats.get("adopted", 0.0)),
+                float(stats.get("candidate_rate", 0.0)),
+                float(stats.get("adopted_rate", 0.0)),
+                int(stats.get("rescue", 0.0)),
+                int(stats.get("harm", 0.0)),
+                int(stats.get("net_rescue", 0.0)),
+                float(stats.get("harm_rate", 0.0)),
+                float(stats.get("rescue_harm_ratio", 0.0)),
+                int(stats.get("disabled_by_validation", 0.0) > 0.0),
+                int(stats.get("disabled_by_validation_adopted", 0.0) > 0.0),
+                int(stats.get("disabled_by_validation_net", 0.0) > 0.0),
+                int(stats.get("disabled_by_validation_ratio", 0.0) > 0.0),
+                int(stats.get("disabled_by_train_harm_guard", 0.0) > 0.0),
+                int(stats.get("train_samples", 0.0)),
+                int(stats.get("train_candidate", 0.0)),
+                int(stats.get("train_rescue", 0.0)),
+                int(stats.get("train_harm", 0.0)),
+                int(stats.get("train_neutral", 0.0)),
+            )
+            for bin_index, bin_stats in sorted(self.client_route_verifier_bin_stats.get(client_id, {}).items()):
+                LOGGER.info(
+                    "%s route verifier %s client=%s bin=%s"
+                    " | disabled=%d | cand_thr=%.4f | adopt_thr=%.4f"
+                    " | n=%d | cand=%d | adopt=%d | cand_rate=%.4f | adopt_rate=%.4f"
+                    " | rescue=%d | harm=%d | net=%d | harm_rate=%.4f | rescue_harm=%.4f"
+                    " | val_fail=%d | val_adopt_fail=%d | val_net_fail=%d | val_ratio_fail=%d",
+                    self.algorithm_name,
+                    context,
+                    client_id,
+                    str(bin_stats.get("confidence_bin_label", self._confidence_bin_label_by_index(bin_index))),
+                    int(bin_stats.get("disabled", 1.0) > 0.0),
+                    float(bin_stats.get("candidate_threshold", 1.01)),
+                    float(bin_stats.get("selected_threshold", 1.01)),
+                    int(bin_stats.get("samples", 0.0)),
+                    int(bin_stats.get("candidate", 0.0)),
+                    int(bin_stats.get("adopted", 0.0)),
+                    float(bin_stats.get("candidate_rate", 0.0)),
+                    float(bin_stats.get("adopted_rate", 0.0)),
+                    int(bin_stats.get("rescue", 0.0)),
+                    int(bin_stats.get("harm", 0.0)),
+                    int(bin_stats.get("net_rescue", 0.0)),
+                    float(bin_stats.get("harm_rate", 0.0)),
+                    float(bin_stats.get("rescue_harm_ratio", 0.0)),
+                    int(bin_stats.get("disabled_by_validation", 0.0) > 0.0),
+                    int(bin_stats.get("disabled_by_validation_adopted", 0.0) > 0.0),
+                    int(bin_stats.get("disabled_by_validation_net", 0.0) > 0.0),
+                    int(bin_stats.get("disabled_by_validation_ratio", 0.0) > 0.0),
+                )
+
     def _restore_best(self) -> None:
         if not self.best_snapshot:
             return
@@ -2249,6 +3920,23 @@ class FedAsymServer(BaseFederatedServer):
             client_id: _clone_tensor_dict(state)
             for client_id, state in self.best_snapshot["client_predictor_states"].items()
         }
+        self.client_candidate_predictor_states = {
+            client_id: _clone_tensor_dict(state)
+            for client_id, state in self.best_snapshot.get("client_candidate_predictor_states", {}).items()
+        }
+        candidate_hidden_dim = int(getattr(self.config.federated, "risk_predictor_hidden_dim", 32))
+        for client_id in self.clients.keys():
+            self.client_candidate_predictor_states.setdefault(
+                client_id,
+                _clone_tensor_dict(self.client_predictor_states[client_id]),
+            )
+            if _risk_predictor_tta_enabled(self.config) and int(
+                self.client_candidate_predictor_states[client_id]["mean"].numel()
+            ) == int(self.client_predictor_states[client_id]["mean"].numel()):
+                self.client_candidate_predictor_states[client_id] = _default_predictor_state(
+                    _configured_predictor_feature_dim(self.config, self.config.model.num_classes),
+                    hidden_dim=candidate_hidden_dim,
+                )
         self.client_error_thresholds = dict(self.best_snapshot["client_error_thresholds"])
         self.client_raw_error_thresholds = dict(
             self.best_snapshot.get("client_raw_error_thresholds", self.client_error_thresholds)
@@ -2271,6 +3959,47 @@ class FedAsymServer(BaseFederatedServer):
             client_id: {int(class_id): float(boost) for class_id, boost in boosts.items()}
             for client_id, boosts in self.best_snapshot.get("client_route_group_threshold_boosts", {}).items()
         }
+        self.client_route_candidate_thresholds = {
+            client_id: float(threshold)
+            for client_id, threshold in self.best_snapshot.get("client_route_candidate_thresholds", {}).items()
+        }
+        for client_id in self.clients.keys():
+            self.client_route_candidate_thresholds.setdefault(client_id, 1.01)
+        self.client_route_candidate_bin_thresholds = {
+            client_id: {int(bin_index): float(threshold) for bin_index, threshold in thresholds.items()}
+            for client_id, thresholds in self.best_snapshot.get("client_route_candidate_bin_thresholds", {}).items()
+        }
+        for client_id in self.clients.keys():
+            self.client_route_candidate_bin_thresholds.setdefault(client_id, {})
+        self.client_route_verifier_states = {
+            client_id: _clone_tensor_dict(state)
+            for client_id, state in self.best_snapshot.get("client_route_verifier_states", {}).items()
+        }
+        hidden_dim = int(getattr(self.config.inference, "route_verifier_hidden_dim", 32))
+        for client_id in self.clients.keys():
+            self.client_route_verifier_states.setdefault(
+                client_id,
+                _default_predictor_state(
+                    _route_verifier_feature_dim(self.config.model.num_classes),
+                    hidden_dim=hidden_dim,
+                ),
+            )
+        self.client_route_verifier_thresholds = {
+            client_id: float(threshold)
+            for client_id, threshold in self.best_snapshot.get("client_route_verifier_thresholds", {}).items()
+        }
+        for client_id in self.clients.keys():
+            self.client_route_verifier_thresholds.setdefault(client_id, 1.01)
+        self.client_route_verifier_bin_thresholds = {
+            client_id: {int(bin_index): float(threshold) for bin_index, threshold in thresholds.items()}
+            for client_id, thresholds in self.best_snapshot.get("client_route_verifier_bin_thresholds", {}).items()
+        }
+        for client_id in self.clients.keys():
+            self.client_route_verifier_bin_thresholds.setdefault(client_id, {})
+        self.client_route_verifier_stats = copy.deepcopy(self.best_snapshot.get("client_route_verifier_stats", {}))
+        self.client_route_verifier_bin_stats = copy.deepcopy(
+            self.best_snapshot.get("client_route_verifier_bin_stats", {})
+        )
         self.latest_distill_stats = dict(self.best_snapshot.get("latest_distill_stats", {}))
         self.current_round = int(self.best_snapshot["round_idx"])
         LOGGER.info("%s restored best from round %d", self.algorithm_name, self.best_snapshot["round_idx"])
@@ -2283,6 +4012,7 @@ class FedAsymServer(BaseFederatedServer):
                 self._retrain_route_predictors()
             elif bool(getattr(self.config.federated, "recalibrate_route_thresholds_on_load", True)):
                 self._recalibrate_route_thresholds()
+            self._refresh_route_verifiers(context="load")
             self.last_history = []
             return []
 
@@ -2305,12 +4035,19 @@ class FedAsymServer(BaseFederatedServer):
             ]
             for update in updates:
                 self.client_predictor_states[update.client_id] = _clone_tensor_dict(update.predictor_state)
+                if update.candidate_predictor_state is not None:
+                    self.client_candidate_predictor_states[update.client_id] = _clone_tensor_dict(
+                        update.candidate_predictor_state
+                    )
+                else:
+                    self.client_candidate_predictor_states[update.client_id] = _clone_tensor_dict(update.predictor_state)
                 self.client_raw_error_thresholds[update.client_id] = float(update.error_threshold)
                 self.client_error_thresholds[update.client_id] = float(update.error_threshold)
 
             public_knowledge = self._aggregate_public_knowledge(updates)
             distill_stats = self._distill_general_model(public_knowledge, round_idx)
             self._apply_route_gain_filter_to_thresholds()
+            self._refresh_route_verifiers(context=f"round_{round_idx}")
 
             expert_eval = self._evaluate_predictor_on_client_tests(self._predict_expert_only, f"{self.algorithm_name}-expert")
             general_eval = self._evaluate_predictor_on_client_tests(self._predict_general_only, f"{self.algorithm_name}-general")
@@ -2340,6 +4077,7 @@ class FedAsymServer(BaseFederatedServer):
                 sum(
                     self._estimate_tensor_payload_bytes(update.public_logits)
                     + self._estimate_tensor_payload_bytes(update.predictor_state)
+                    + self._estimate_tensor_payload_bytes(update.candidate_predictor_state)
                     for update in updates
                 )
             )
@@ -2466,7 +4204,12 @@ class FedAsymServer(BaseFederatedServer):
             else 0.0
         )
         total_upload_bytes = self.last_history[-1].upload_bytes_total if self.last_history else 0.0
-        extra_metrics = self._build_round_extra_metrics(expert_eval, general_eval, routed_eval)
+        extra_metrics = self._build_round_extra_metrics(
+            expert_eval,
+            general_eval,
+            routed_eval,
+            include_oracle_diagnostics=True,
+        )
         return {
             "algorithm": self.algorithm_name,
             "metrics": {
